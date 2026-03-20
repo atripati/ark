@@ -40,11 +40,9 @@ func TestEngineExpandOnFailure(t *testing.T) {
 
 	engine := NewEngine(mgr, DefaultEngineConfig())
 
-	// Initial preparation
 	plan := engine.PrepareContext("task-2", "create a github issue about a bug")
 	initialCount := len(plan.ToolsLoaded)
 
-	// Simulate: model couldn't find the right tool
 	result := ExecutionResult{
 		Success:   false,
 		ErrorType: ErrToolNotFound,
@@ -77,7 +75,6 @@ func TestEngineUpgradeOnMisuse(t *testing.T) {
 	engine := NewEngine(mgr, DefaultEngineConfig())
 	plan := engine.PrepareContext("task-3", "create a pull request on github")
 
-	// Simulate: model called tool with wrong params (compression too aggressive)
 	result := ExecutionResult{
 		Success:     false,
 		ToolUsed:    plan.ToolsLoaded[0],
@@ -105,7 +102,6 @@ func TestEngineSuccessNoAdaptation(t *testing.T) {
 	engine := NewEngine(mgr, DefaultEngineConfig())
 	plan := engine.PrepareContext("task-4", "send a message on slack")
 
-	// Simulate success
 	result := ExecutionResult{
 		Success:  true,
 		ToolUsed: "slack-0",
@@ -128,7 +124,6 @@ func TestEngineMaxRetries(t *testing.T) {
 
 	plan := engine.PrepareContext("task-5", "query the database")
 
-	// Fail twice
 	for i := 0; i < 2; i++ {
 		result := ExecutionResult{
 			Success:   false,
@@ -141,7 +136,6 @@ func TestEngineMaxRetries(t *testing.T) {
 		}
 	}
 
-	// Third attempt should be nil (max retries reached)
 	result := ExecutionResult{
 		Success:   false,
 		ErrorType: ErrToolNotFound,
@@ -166,7 +160,6 @@ func TestEngineSwapFailedTool(t *testing.T) {
 
 	failedTool := plan.ToolsLoaded[0]
 
-	// Simulate: tool itself failed (e.g., API error)
 	result := ExecutionResult{
 		Success:     false,
 		ToolUsed:    failedTool,
@@ -184,7 +177,6 @@ func TestEngineSwapFailedTool(t *testing.T) {
 		t.Errorf("expected strategy 'swapped', got %s", newPlan.Strategy)
 	}
 
-	// The failed tool should no longer be active
 	if mgr.IsActive(failedTool) {
 		t.Error("failed tool should have been evicted")
 	}
@@ -198,7 +190,6 @@ func TestToolRankerLearning(t *testing.T) {
 
 	ranker := NewToolRanker()
 
-	// Simulate history: github-0 always succeeds, github-1 always fails
 	for i := 0; i < 10; i++ {
 		ranker.RecordSuccess("github-0", 50*time.Millisecond)
 		ranker.RecordFailure("github-1", ErrToolFailed)
@@ -210,7 +201,6 @@ func TestToolRankerLearning(t *testing.T) {
 		t.Fatal("expected ranked tools")
 	}
 
-	// github-0 should rank higher than github-1 (100% vs 0% success rate)
 	idx0, idx1 := -1, -1
 	var score0, score1 float64
 	for i, r := range ranked {
@@ -235,12 +225,10 @@ func TestToolRankerLearning(t *testing.T) {
 			score0, idx0, score1, idx1)
 	}
 
-	// Verify scores are NOT flat
 	if len(ranked) >= 2 && ranked[0].Score == ranked[1].Score {
 		t.Error("scores should NOT be identical (the whole point of v2 scoring)")
 	}
 
-	// Verify predictions differ
 	for _, r := range ranked {
 		if r.ID == "github-0" && r.Predicted != "high" {
 			t.Errorf("github-0 with 100%% success should be predicted 'high', got %q", r.Predicted)
@@ -260,17 +248,14 @@ func TestContextMemoryLearning(t *testing.T) {
 
 	ranker := NewToolRanker()
 
-	// First query: no memory, all tools score equally
 	ranked1 := ranker.Rank("search jira issues", mgr)
 	if len(ranked1) == 0 {
 		t.Fatal("expected ranked tools")
 	}
 
-	// Record that jira-3 worked well for this query pattern
 	ranker.RecordContext("search jira issues assigned to me", []string{"jira-3"})
 	ranker.RecordSuccess("jira-3", 30*time.Millisecond)
 
-	// Second query (similar): jira-3 should now score higher due to memory
 	ranked2 := ranker.Rank("search jira issues", mgr)
 
 	var score3Before, score3After float64
@@ -294,30 +279,27 @@ func TestContextMemoryLearning(t *testing.T) {
 }
 
 func TestScoreDifferentiation(t *testing.T) {
-	// The whole point: scores should NOT be flat anymore
+
 	mgr := NewManager(DefaultBudget(200000))
 	registerTestTools(mgr)
 
 	ranker := NewToolRanker()
 
-	// Give some tools history to differentiate them
-	ranker.RecordSuccess("github-0", 20*time.Millisecond) // Fast success
+	ranker.RecordSuccess("github-0", 20*time.Millisecond)
 	ranker.RecordSuccess("github-0", 25*time.Millisecond)
-	ranker.RecordFailure("github-2", ErrToolFailed) // Failure
-	ranker.RecordSuccess("github-4", 500*time.Millisecond) // Slow success
+	ranker.RecordFailure("github-2", ErrToolFailed)
+	ranker.RecordSuccess("github-4", 500*time.Millisecond)
 
 	ranked := ranker.Rank("create github pull request", mgr)
 
-	// Collect all unique scores
 	scores := make(map[string]float64)
 	for _, r := range ranked {
 		scores[r.ID] = r.Score
 	}
 
-	// Count how many distinct scores we have
 	uniqueScores := make(map[float64]bool)
 	for _, s := range scores {
-		// Round to 3 decimal places to avoid float noise
+
 		rounded := float64(int(s*1000)) / 1000
 		uniqueScores[rounded] = true
 	}
@@ -342,17 +324,14 @@ func TestTracerRecording(t *testing.T) {
 
 	engine := NewEngine(mgr, DefaultEngineConfig())
 
-	// Run through a full cycle
 	plan := engine.PrepareContext("task-trace", "create a github issue")
 
-	// Simulate failure then success
 	engine.AdaptContext(plan, ExecutionResult{
 		Success:   false,
 		ErrorType: ErrToolNotFound,
 		ErrorMsg:  "tool not loaded",
 	})
 
-	// Get the trace
 	trace := engine.TracerRef().GetTrace(plan.TraceID)
 	if trace == nil {
 		t.Fatal("expected trace to exist")
@@ -362,7 +341,6 @@ func TestTracerRecording(t *testing.T) {
 		t.Errorf("expected at least 3 events (ranking, prepared, result), got %d", len(trace.Events))
 	}
 
-	// Print it
 	output := engine.TracerRef().PrintTrace(plan.TraceID)
 	if !strings.Contains(output, "task-trace") {
 		t.Error("trace output should contain task ID")
@@ -375,31 +353,27 @@ func TestTracerRecording(t *testing.T) {
 }
 
 func TestMultiStepContextEvolution(t *testing.T) {
-	// Simulate: GitHub → Jira → Slack (multi-step task)
+
 	mgr := NewManager(DefaultBudget(200000))
 	registerTestTools(mgr)
 
 	engine := NewEngine(mgr, DefaultEngineConfig())
 
-	// Step 1: GitHub context
 	plan1 := engine.PrepareContext("multi-step", "get latest commits from github")
 	t.Logf("Step 1 (GitHub): %d tools loaded", len(plan1.ToolsLoaded))
 
-	// Simulate success
 	engine.AdaptContext(plan1, ExecutionResult{
 		Success:  true,
 		ToolUsed: plan1.ToolsLoaded[0],
 		Latency:  30 * time.Millisecond,
 	})
 
-	// Step 2: Now need Jira tools — evict github, load jira
 	for _, id := range plan1.ToolsLoaded {
 		mgr.Evict(id)
 	}
 	plan2 := engine.PrepareContext("multi-step-2", "search jira issues assigned to me")
 	t.Logf("Step 2 (Jira): %d tools loaded", len(plan2.ToolsLoaded))
 
-	// Verify Jira tools are loaded and dominant
 	jiraCount := 0
 	githubCount := 0
 	for _, id := range plan2.ToolsLoaded {
@@ -418,7 +392,6 @@ func TestMultiStepContextEvolution(t *testing.T) {
 		t.Errorf("step 2: Jira tools should dominate (jira=%d, github=%d)", jiraCount, githubCount)
 	}
 
-	// Step 3: Notify on Slack
 	for _, id := range plan2.ToolsLoaded {
 		mgr.Evict(id)
 	}
@@ -438,8 +411,6 @@ func TestMultiStepContextEvolution(t *testing.T) {
 	t.Logf("Multi-step context evolution: GitHub(%d) → Jira(%d) → Slack(%d)",
 		len(plan1.ToolsLoaded), len(plan2.ToolsLoaded), len(plan3.ToolsLoaded))
 }
-
-// ── Test helpers ──
 
 func registerTestTools(mgr *Manager) {
 	servers := map[string][]string{

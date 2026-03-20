@@ -1,16 +1,3 @@
-// Package context - engine.go implements the Dynamic Context Engine.
-//
-// This is the "brain" upgrade that transforms ARK from a static context
-// optimizer into an intelligent context decision engine.
-//
-// The key insight: instead of loading tools once and hoping for the best,
-// the engine observes execution results and dynamically adjusts context.
-//
-//   Task arrives → Load minimal tools → Execute → Observe result
-//       ↑                                              │
-//       └──── Expand context if confused/failed ◄──────┘
-//
-// This is what makes ARK a runtime, not just a library.
 package context
 
 import (
@@ -21,35 +8,22 @@ import (
 	"time"
 )
 
-// ──────────────────────────────────────────────────────────
-// Dynamic Context Engine
-// ──────────────────────────────────────────────────────────
-
-// Engine wraps the Manager with dynamic context intelligence.
-// It observes execution outcomes and adjusts context in real-time.
 type Engine struct {
-	mu      sync.Mutex
-	mgr     *Manager
-	tracer  *Tracer
-	ranker  *ToolRanker
-	config  EngineConfig
+	mu     sync.Mutex
+	mgr    *Manager
+	tracer *Tracer
+	ranker *ToolRanker
+	config EngineConfig
 }
 
-// EngineConfig controls the engine's behavior.
 type EngineConfig struct {
-	// InitialTools: how many tools to load on first attempt (start minimal)
-	InitialTools int
-	// ExpandStep: how many additional tools to load on each retry
-	ExpandStep int
-	// MaxRetries: maximum expand-and-retry cycles before giving up
-	MaxRetries int
-	// CompressFirst: try compressed schemas first, fall back to full if model struggles
-	CompressFirst bool
-	// ValidateCompression: test if compressed schemas are still usable
+	InitialTools        int
+	ExpandStep          int
+	MaxRetries          int
+	CompressFirst       bool
 	ValidateCompression bool
 }
 
-// DefaultEngineConfig returns sensible defaults.
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
 		InitialTools:        3,
@@ -60,7 +34,6 @@ func DefaultEngineConfig() EngineConfig {
 	}
 }
 
-// NewEngine creates a dynamic context engine.
 func NewEngine(mgr *Manager, config EngineConfig) *Engine {
 	return &Engine{
 		mgr:    mgr,
@@ -70,41 +43,33 @@ func NewEngine(mgr *Manager, config EngineConfig) *Engine {
 	}
 }
 
-// Tracer returns the engine's tracer for external inspection.
 func (e *Engine) TracerRef() *Tracer {
 	return e.tracer
 }
 
-// Manager returns the underlying context manager.
 func (e *Engine) Manager() *Manager {
 	return e.mgr
 }
 
-// ──────────────────────────────────────────────────────────
-// Execution Cycle — the core dynamic loop
-// ──────────────────────────────────────────────────────────
-
-// ExecutionResult represents what happened when the model tried to use context.
 type ExecutionResult struct {
 	Success     bool
-	ToolUsed    string   // Which tool the model actually called
-	ToolsFailed []string // Tools the model tried but failed
+	ToolUsed    string
+	ToolsFailed []string
 	ErrorType   ErrorType
 	ErrorMsg    string
 	TokensUsed  int
 	Latency     time.Duration
 }
 
-// ErrorType classifies what went wrong so the engine can react appropriately.
 type ErrorType int
 
 const (
-	NoError          ErrorType = iota
-	ErrToolNotFound            // Model wanted a tool that wasn't loaded
-	ErrToolMisuse              // Model called a tool with wrong params (likely bad compression)
-	ErrToolFailed              // Tool was called correctly but external failure
-	ErrNoRelevantTool          // Model couldn't find any relevant tool
-	ErrContextOverflow         // Ran out of context budget
+	NoError ErrorType = iota
+	ErrToolNotFound
+	ErrToolMisuse
+	ErrToolFailed
+	ErrNoRelevantTool
+	ErrContextOverflow
 )
 
 func (et ErrorType) String() string {
@@ -115,27 +80,23 @@ func (et ErrorType) String() string {
 	return "unknown"
 }
 
-// ContextPlan represents the engine's decision for a given task.
 type ContextPlan struct {
-	TaskID        string
-	Query         string
-	Attempt       int
-	ToolsLoaded   []string
-	ToolsFull     []string  // Tools loaded at full schema (not compressed)
-	TokensUsed    int
-	Strategy      string    // "minimal", "expanded", "full_schema", "max_context"
-	TraceID       string
+	TaskID      string
+	Query       string
+	Attempt     int
+	ToolsLoaded []string
+	ToolsFull   []string
+	TokensUsed  int
+	Strategy    string
+	TraceID     string
 }
 
-// PrepareContext is the main entry point. Given a task query,
-// it returns a ContextPlan describing what was loaded and why.
 func (e *Engine) PrepareContext(taskID, query string) *ContextPlan {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	traceID := e.tracer.StartTrace(taskID, query)
 
-	// Step 1: Get ranked tool candidates
 	ranked := e.ranker.Rank(query, e.mgr)
 	e.tracer.Record(traceID, TraceEvent{
 		Type:    EventToolRanking,
@@ -143,7 +104,6 @@ func (e *Engine) PrepareContext(taskID, query string) *ContextPlan {
 		Data:    formatRankedTools(ranked),
 	})
 
-	// Step 2: Load initial minimal set
 	loadCount := e.config.InitialTools
 	if loadCount > len(ranked) {
 		loadCount = len(ranked)
@@ -153,7 +113,6 @@ func (e *Engine) PrepareContext(taskID, query string) *ContextPlan {
 	for i := 0; i < loadCount; i++ {
 		tool := ranked[i]
 
-		// Try compressed first if configured
 		if e.config.CompressFirst {
 			err := e.mgr.Load(tool.ID)
 			if err == nil {
@@ -191,31 +150,25 @@ func (e *Engine) PrepareContext(taskID, query string) *ContextPlan {
 	return plan
 }
 
-// AdaptContext is called AFTER execution with the result.
-// This is the "observe → expand → retry" loop.
-// Returns an updated plan if context was changed, or nil if no adaptation needed.
 func (e *Engine) AdaptContext(plan *ContextPlan, result ExecutionResult) *ContextPlan {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Record the execution result
 	e.tracer.Record(plan.TraceID, TraceEvent{
 		Type:    EventExecutionResult,
 		Message: fmt.Sprintf("Attempt %d: success=%v, error=%s", plan.Attempt, result.Success, result.ErrorType),
 		Data:    result.ErrorMsg,
 	})
 
-	// Update tool ranking based on result
 	if result.Success && result.ToolUsed != "" {
 		e.ranker.RecordSuccess(result.ToolUsed, result.Latency)
-		// Record to context memory: "this tool worked for this query"
+		// Record to context memory: "this tool worked only for this query"
 		e.ranker.RecordContext(plan.Query, []string{result.ToolUsed})
 	}
 	for _, failed := range result.ToolsFailed {
 		e.ranker.RecordFailure(failed, result.ErrorType)
 	}
 
-	// If successful, no adaptation needed
 	if result.Success {
 		e.tracer.Record(plan.TraceID, TraceEvent{
 			Type:    EventTraceComplete,
@@ -224,7 +177,6 @@ func (e *Engine) AdaptContext(plan *ContextPlan, result ExecutionResult) *Contex
 		return nil
 	}
 
-	// Check retry budget
 	if plan.Attempt >= e.config.MaxRetries {
 		e.tracer.Record(plan.TraceID, TraceEvent{
 			Type:    EventMaxRetriesReached,
@@ -232,8 +184,6 @@ func (e *Engine) AdaptContext(plan *ContextPlan, result ExecutionResult) *Contex
 		})
 		return nil
 	}
-
-	// ── Adaptation strategies based on error type ──
 
 	newPlan := &ContextPlan{
 		TaskID:  plan.TaskID,
@@ -244,28 +194,22 @@ func (e *Engine) AdaptContext(plan *ContextPlan, result ExecutionResult) *Contex
 
 	switch result.ErrorType {
 	case ErrToolNotFound:
-		// Model wanted a tool we didn't load → expand with more tools
 		newPlan.Strategy = "expanded"
 		e.expandContext(newPlan, plan)
 
 	case ErrToolMisuse:
-		// Model misunderstood the tool → compression was too aggressive
-		// Fall back to full schemas for the tools we have
 		newPlan.Strategy = "full_schema"
 		e.upgradeToFullSchema(newPlan, plan)
 
 	case ErrNoRelevantTool:
-		// None of the loaded tools matched → broaden search
 		newPlan.Strategy = "broadened"
 		e.broadenContext(newPlan, plan)
 
 	case ErrToolFailed:
-		// Tool itself failed → swap to alternative tool
 		newPlan.Strategy = "swapped"
 		e.swapFailedTool(newPlan, plan, result.ToolsFailed)
 
 	default:
-		// Generic expansion
 		newPlan.Strategy = "expanded"
 		e.expandContext(newPlan, plan)
 	}
@@ -282,10 +226,7 @@ func (e *Engine) AdaptContext(plan *ContextPlan, result ExecutionResult) *Contex
 	return newPlan
 }
 
-// ── Adaptation strategies ──
-
 func (e *Engine) expandContext(newPlan, oldPlan *ContextPlan) {
-	// Load more tools beyond what we already have
 	ranked := e.ranker.Rank(oldPlan.Query, e.mgr)
 	loaded := 0
 	for _, tool := range ranked {
@@ -301,8 +242,6 @@ func (e *Engine) expandContext(newPlan, oldPlan *ContextPlan) {
 }
 
 func (e *Engine) upgradeToFullSchema(newPlan, oldPlan *ContextPlan) {
-	// For currently loaded tools, evict compressed and reload full
-	// This is the compression validation safety net
 	fullTools := make([]string, 0)
 	for _, id := range oldPlan.ToolsLoaded {
 		e.mgr.Evict(id)
@@ -330,18 +269,13 @@ func (e *Engine) upgradeToFullSchema(newPlan, oldPlan *ContextPlan) {
 }
 
 func (e *Engine) broadenContext(newPlan, oldPlan *ContextPlan) {
-	// The current query didn't match well. Try loading tools from
-	// different categories than what we already have.
 	activeTypes := make(map[string]bool)
 	for _, id := range oldPlan.ToolsLoaded {
-		// Extract server prefix from tool ID (e.g., "github" from "github-3")
 		parts := strings.SplitN(id, "-", 2)
 		if len(parts) > 0 {
 			activeTypes[parts[0]] = true
 		}
 	}
-
-	// Load tools from servers we haven't tried yet
 	loaded := 0
 	for id, block := range e.mgr.AllBlocks() {
 		if loaded >= e.config.ExpandStep {
@@ -422,13 +356,13 @@ type ToolRanker struct {
 
 // ToolStats tracks a tool's historical performance.
 type ToolStats struct {
-	TotalCalls      int
-	Successes       int
-	Failures        int
-	ConsecutiveFails int  // Track streaks for confidence
-	AvgLatency      time.Duration
-	LastUsed        time.Time
-	LastErrorType   ErrorType
+	TotalCalls       int
+	Successes        int
+	Failures         int
+	ConsecutiveFails int // Track streaks for confidence
+	AvgLatency       time.Duration
+	LastUsed         time.Time
+	LastErrorType    ErrorType
 }
 
 // SuccessRate returns the tool's success rate (0.0 to 1.0).
@@ -827,7 +761,7 @@ type TraceEvent struct {
 type TraceEventType int
 
 const (
-	EventToolRanking      TraceEventType = iota // Tools were scored and ranked
+	EventToolRanking       TraceEventType = iota // Tools were scored and ranked
 	EventToolLoaded                              // A tool was loaded into context
 	EventToolEvicted                             // A tool was evicted
 	EventContextPrepared                         // Initial context was assembled

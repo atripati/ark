@@ -49,8 +49,6 @@ func TestRegisterAndLoad(t *testing.T) {
 
 func TestCompressionSavesTokens(t *testing.T) {
 	m := NewManager(DefaultBudget(200000))
-
-	// Simulate a typical MCP tool with a large JSON schema
 	fullSchema := strings.Repeat(`{"name":"create_issue","description":"Creates a new issue in a GitHub repository","parameters":{"type":"object","properties":{"repo":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}}}}`, 5)
 
 	block := m.RegisterTool("tool-github-issues", "create_issue",
@@ -68,13 +66,9 @@ func TestCompressionSavesTokens(t *testing.T) {
 }
 
 func TestTokenBloatSimulation(t *testing.T) {
-	// This test demonstrates ARK's value proposition:
-	// Simulate 7 MCP servers with ~30 tools each (the real-world scenario
-	// that eats 67,300 tokens / 33.7% of context before any work happens)
 
 	m := NewManager(DefaultBudget(200000))
 
-	// Register 7 servers × ~30 tools = 210 tools
 	servers := []string{"github", "slack", "jira", "gmail", "drive", "calendar", "database"}
 	totalRawTokens := 0
 	toolCount := 0
@@ -82,7 +76,6 @@ func TestTokenBloatSimulation(t *testing.T) {
 	for _, server := range servers {
 		for i := 0; i < 30; i++ {
 			name := fmt.Sprintf("%s_tool_%d", server, i)
-			// Typical MCP tool schema is ~300-500 tokens
 			schema := fmt.Sprintf(`{"name":"%s","description":"Tool %d for %s server with full parameter schema including types, defaults, constraints, and examples","inputSchema":{"type":"object","properties":{"param1":{"type":"string","description":"First parameter with detailed description"},"param2":{"type":"integer","description":"Second parameter"},"param3":{"type":"boolean","default":false}},"required":["param1"]}}`, name, i, server)
 
 			block := m.RegisterTool(
@@ -95,12 +88,8 @@ func TestTokenBloatSimulation(t *testing.T) {
 			toolCount++
 		}
 	}
-
-	// Now load ALL tools (what raw MCP does)
 	rawPct := float64(totalRawTokens) / float64(200000) * 100
 
-	// With ARK: only load tools relevant to the current task
-	// Simulate: user asks about GitHub issues
 	loaded := m.LoadRelevant("create a github issue for the bug", 10)
 
 	stats := m.Stats()
@@ -112,32 +101,27 @@ func TestTokenBloatSimulation(t *testing.T) {
 	t.Logf("ARK approach: loaded %d relevant tools", len(loaded))
 	t.Logf("Tokens saved: %d", stats.TokensSaved)
 	t.Logf("\n%s", usage)
-
-	// ARK should use dramatically less context than raw MCP
 	if rawPct < 20 {
 		t.Logf("Warning: raw token usage lower than expected (%.1f%%)", rawPct)
 	}
 
-	// Verify we loaded relevant tools, not everything
 	if len(loaded) > 10 {
 		t.Errorf("should load at most 10 tools, loaded %d", len(loaded))
 	}
 }
 
 func TestEvictionByPriority(t *testing.T) {
-	// Small budget to force evictions
 	budget := TokenBudget{
-		Total: 1000,
-		Tools: 200,
-		System: 100,
-		Memory: 200,
+		Total:        1000,
+		Tools:        200,
+		System:       100,
+		Memory:       200,
 		Conversation: 300,
-		Working: 100,
-		Reserved: 100,
+		Working:      100,
+		Reserved:     100,
 	}
 	m := NewManager(budget)
 
-	// Register two tools that together exceed the budget
 	m.Register(&ContextBlock{
 		ID: "low-priority", Type: BlockTool,
 		Content: "Low priority tool", TokenCount: 150,
@@ -151,12 +135,10 @@ func TestEvictionByPriority(t *testing.T) {
 		Tags: []string{"high"},
 	})
 
-	// Load low priority first
 	if err := m.Load("low-priority"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Loading high priority should evict low priority
 	if err := m.Load("high-priority"); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +148,6 @@ func TestEvictionByPriority(t *testing.T) {
 		t.Errorf("expected 1 eviction, got %d", stats.TotalEvictions)
 	}
 
-	// High priority should be active, low should be evicted
 	active := m.ActiveBlocks()
 	if len(active) != 1 || active[0] != "high-priority" {
 		t.Errorf("expected only high-priority to be active, got %v", active)
@@ -183,7 +164,6 @@ func TestRelevanceLoading(t *testing.T) {
 	m.RegisterTool("sl-2", "slack_list_channels", "List all Slack channels", "{}")
 	m.RegisterTool("db-1", "database_query", "Execute a SQL query on the database", "{}")
 
-	// Query about GitHub — should load GitHub tools, not Slack/DB
 	loaded := m.LoadRelevant("create a pull request on github", 3)
 
 	hasGithub := false
@@ -252,7 +232,7 @@ func TestEstimateTokens(t *testing.T) {
 		expected int
 	}{
 		{"", 0},
-		{"hello", 2},  // 5 chars / 4 ≈ 2
+		{"hello", 2},                      // 5 chars / 4 ≈ 2
 		{"hello world this is a test", 7}, // 26 chars / 4 ≈ 7
 	}
 
