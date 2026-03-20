@@ -1,4 +1,14 @@
 # ARK — AI Runtime Kernel
+🚨 AI agents are wasting ~30% of their context before doing any work.
+They load ALL tools upfront.
+ARK fixes this.
+
+→ Loads only relevant tools  
+→ Reduces context by ~99%  
+→ Adapts when tools fail  
+
+This gives your model its reasoning space back.
+
 
 > A Context Operating System for AI agents. We virtualize context for LLMs.
 
@@ -40,7 +50,7 @@ ARK is a single runtime that manages what your LLM sees. It loads only the tools
 └─────────────────────────────────────────────────┘
 ```
 
-## Benchmark: 99.9% Less Context Waste
+## Benchmark: ~99% reduction in tool context overhead
 
 ```
 $ go run ./cmd/ark bench
@@ -70,6 +80,8 @@ $ go run ./cmd/ark bench
   │  Reduction           —               99.9%       │
   └──────────────────────────────────────────────────┘
 ```
+🧠 MCP gives your model less room to think.  
+⚡ ARK gives it that space back.
 
 ## Dynamic Context: Observe → Adapt → Recover
 
@@ -141,27 +153,27 @@ import (
 )
 
 func main() {
-    // Create manager with 200k token budget
+    ////// Create manager with 200k token budget
     mgr := ctx.NewManager(ctx.DefaultBudget(200000))
 
-    // Register tools (lazy — no context consumed yet)
+    //// Register tools (lazy — no context consumed yet)
     mgr.RegisterTool("gh-pr", "create_pr",
         "Create a pull request on GitHub", fullSchema)
 
-    // Create the dynamic engine
+    ///////// Create the dynamic engine
     engine := ctx.NewEngine(mgr, ctx.DefaultEngineConfig())
 
-    // Prepare context for a task (loads minimal relevant tools)
+    //////// Prepare context for a task (loads minimal relevant tools)
     plan := engine.PrepareContext("task-1", "create a github PR")
 
-    // ... execute with your LLM ...
+    // ////... execute with your LLM ...
 
-    // If it fails, adapt and retry
+    /////// If it fails, adapt and retry
     result := ctx.ExecutionResult{Success: false, ErrorType: ctx.ErrToolFailed}
     newPlan := engine.AdaptContext(plan, result)
-    // ARK swaps failed tools, loads alternatives, retries
+    // ///ARK swaps failed tools, loads alternatives, retries
 
-    // Full decision trace
+    ////// Full decision trace  gyus
     fmt.Println(engine.TracerRef().PrintTrace(plan.TraceID))
 }
 ```
@@ -184,6 +196,12 @@ ark/
 ├── CONTRIBUTING.md           Contributor guide
 └── README.md
 ```
+
+## Who is this for?
+
+- Developers building AI agents
+- Teams struggling with tool bloat (MCP, LangChain, etc.)
+- Anyone hitting context limits or high token costs
 
 ## Roadmap
 
@@ -248,3 +266,6 @@ You are free to use, modify, and distribute ARK. If you redistribute modified ve
 3. **No trademark use**: Do not use "ARK" or contributor names to endorse derivative products without permission
 
 Copyright 2026 Abhishek Tripathi and ARK Contributors.
+
+
+⭐ If this resonates, star the repo.
