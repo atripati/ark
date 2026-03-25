@@ -1,17 +1,21 @@
-// ////ARK — AI Runtime Kernel
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/atripati/ark/pkg/config"
 	ctx "github.com/atripati/ark/pkg/context"
+	"github.com/atripati/ark/pkg/models"
 	"github.com/atripati/ark/pkg/runtime"
+	"github.com/atripati/ark/pkg/store"
+	"github.com/atripati/ark/pkg/tools"
 )
 
-const version = "0.1.0-alpha"
+const version = "0.4.0-alpha"
 
 const banner = `
     _    ____  _  __
@@ -33,11 +37,39 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Printf("ark v%s\n", version)
 
+	case "run":
+		configPath := "agent.yaml"
+		taskArgs := ""
+		allowWrite := false
+		dryRun := false
+
+		for i := 2; i < len(os.Args); i++ {
+			switch os.Args[i] {
+			case "--task":
+				if i+1 < len(os.Args) {
+					taskArgs = os.Args[i+1]
+					i++
+				}
+			case "--allow-write":
+				allowWrite = true
+			case "--dry-run":
+				dryRun = true
+			default:
+				if !strings.HasPrefix(os.Args[i], "--") && configPath == "agent.yaml" {
+					configPath = os.Args[i]
+				}
+			}
+		}
+		runAgent(configPath, taskArgs, allowWrite, dryRun)
+
 	case "bench", "benchmark":
 		runBenchmark()
 
 	case "demo":
 		runDemo()
+
+	case "demo-learn":
+		runDemoLearn()
 
 	case "init":
 		runInit()
@@ -56,11 +88,30 @@ func printUsage() {
 	fmt.Printf(banner, version)
 	fmt.Println(`
 Commands:
-  init       Initialize a new ARK agent project
-  bench      Run the MCP token bloat benchmark (see the savings)
-  demo       Run the dynamic context engine demo (see load→adapt→retry)
-  version    Print version
-  help       Show this help
+  run          Run an agent (ark run agent.yaml --task "your task here")
+  init         Initialize a new ARK agent project
+  bench        Run the MCP token bloat benchmark (see the savings)
+  demo         Run the dynamic context engine demo (see load→adapt→retry)
+  demo-learn   Prove ARK learns: ranking improves across 3 simulated runs
+  version      Print version
+  help         Show this help
+
+Getting Started:
+  $ ark init                                    # create agent.yaml
+  $ export ANTHROPIC_API_KEY=sk-...             # or OPENAI_API_KEY
+  $ ark run agent.yaml --task "list my github repos"
+
+Safety Flags:
+  --allow-write  Enable write operations (create issues, etc.)
+  --dry-run      Simulate execution without calling real APIs
+
+Providers:
+  anthropic  Set ANTHROPIC_API_KEY env var
+  openai     Set OPENAI_API_KEY env var
+  ollama     No key needed (runs locally at localhost:11434)
+
+Tools:
+  github     Set GITHUB_TOKEN for write access (reads work without it)
 
 Getting Started:
   $ ark init
@@ -80,7 +131,7 @@ version: "0.1"
 
 # Model configuration (swap providers with a single line change)
 model:
-  provider: anthropic  # anthropic | openai | ollama | custom
+  provider: anthropic  # anthropic | openai | ollama
   name: claude-sonnet-4-20250514
   max_tokens: 4096
 
@@ -107,7 +158,7 @@ tools:
     
 # Memory configuration
 memory:
-  backend: sqlite  # sqlite | postgres | custom
+  backend: file  # file | memory (sqlite coming soon)
   shared: false    # Enable shared memory graph for multi-agent
   path: "./ark-memory.db"
 
@@ -247,7 +298,6 @@ func runBenchmark() {
 	fmt.Println()
 
 	avgToolsLoaded := totalArkTokens / max(1, len(queries))
-
 	avgToolCount := 0
 	for _, q := range queries {
 		loaded := m.LoadRelevant(q.query, 5)
@@ -287,7 +337,6 @@ func max(a, b int) int {
 }
 
 func generateRealisticSchema(server, tool string) string {
-
 	return fmt.Sprintf(`{
   "name": "%s_%s",
   "description": "Performs the %s operation on the %s server. This tool allows you to interact with %s resources including creating, reading, updating, and deleting items. Supports pagination, filtering, and sorting. Returns structured JSON responses with status codes and metadata.",
@@ -366,4 +415,434 @@ func runDemo() {
 	}
 
 	runtime.RunDemo(mgr)
+}
+
+func runAgent(configPath, task string, allowWrite, dryRun bool) {
+	fmt.Printf(banner, version)
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ❌ Error loading config: %v\n\n", err)
+		fmt.Fprintf(os.Stderr, "  Run 'ark init' to create a starter agent.yaml\n")
+		os.Exit(1)
+	}
+
+	fmt.Printf("  Agent:    %s (v%s)\n", cfg.Name, cfg.Version)
+	fmt.Printf("  Provider: %s/%s\n", cfg.Model.Provider, cfg.Model.Name)
+	fmt.Printf("  Context:  %dk tokens, strategy=%s\n", cfg.Context.TotalTokens/1000, cfg.Context.Strategy)
+
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "\n  ❌ Config error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if cfg.Model.APIKey != "" {
+		key := cfg.Model.APIKey
+		if len(key) > 12 {
+			fmt.Printf("  API Key:  %s...%s\n", key[:7], key[len(key)-4:])
+		} else {
+			fmt.Printf("  API Key:  ***\n")
+		}
+	} else if cfg.Model.Provider == "ollama" {
+		fmt.Printf("  Endpoint: %s\n", cfg.Model.BaseURL)
+	}
+
+	provider, err := models.New(
+		cfg.Model.Provider,
+		cfg.Model.Name,
+		cfg.Model.APIKey,
+		cfg.Model.BaseURL,
+		cfg.Model.MaxTokens,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n  ❌ Provider error: %v\n", err)
+		os.Exit(1)
+	}
+
+	budget := ctx.DefaultBudget(cfg.Context.TotalTokens)
+	if cfg.Context.ToolBudgetPct > 0 {
+		budget.Tools = cfg.Context.TotalTokens * cfg.Context.ToolBudgetPct / 100
+	}
+	if cfg.Context.MemoryBudgetPct > 0 {
+		budget.Memory = cfg.Context.TotalTokens * cfg.Context.MemoryBudgetPct / 100
+	}
+	if cfg.Context.ConversationBudgetPct > 0 {
+		budget.Conversation = cfg.Context.TotalTokens * cfg.Context.ConversationBudgetPct / 100
+	}
+	mgr := ctx.NewManager(budget)
+
+	for i, tool := range cfg.Tools {
+		desc := tool.Description
+		if desc == "" {
+			desc = fmt.Sprintf("%s tool (%s)", tool.Name, tool.Type)
+		}
+		mgr.RegisterTool(
+			fmt.Sprintf("%s-%d", tool.Name, i),
+			tool.Name,
+			desc,
+			fmt.Sprintf(`{"name":"%s","type":"%s","description":"%s"}`, tool.Name, tool.Type, desc),
+		)
+	}
+
+	engineConfig := ctx.DefaultEngineConfig()
+	if cfg.Context.InitialTools > 0 {
+		engineConfig.InitialTools = cfg.Context.InitialTools
+	}
+	if cfg.Context.MaxRetries > 0 {
+		engineConfig.MaxRetries = cfg.Context.MaxRetries
+	}
+
+	var engine *ctx.Engine
+	var memStore *store.JSONFileStore
+
+	if cfg.Memory.Backend == "file" || cfg.Memory.Backend == "sqlite" {
+		memoryPath := cfg.Memory.Path
+		if memoryPath == "" {
+			memoryPath = "./ark-memory.json"
+		}
+		if strings.HasSuffix(memoryPath, ".db") {
+			memoryPath = strings.TrimSuffix(memoryPath, ".db") + ".json"
+		}
+
+		if cfg.Memory.Backend == "sqlite" {
+			fmt.Printf("  Memory:   ⚠️  SQLite not yet implemented, using file backend\n")
+		}
+
+		s, storeErr := store.NewJSONFileStore(memoryPath)
+		if storeErr != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠️  Memory store failed: %v (continuing without persistence)\n", storeErr)
+			engine = ctx.NewEngine(mgr, engineConfig)
+		} else {
+			memStore = s
+			decayed := s.Decay()
+			engine = ctx.NewEngineWithStore(mgr, engineConfig, s)
+			stats := s.RecordCount()
+			patterns := s.PatternCount()
+			if stats > 0 || patterns > 0 {
+				msg := fmt.Sprintf("  Memory:   ✅ loaded %d tool stats, %d patterns from %s", stats, patterns, memoryPath)
+				if decayed > 0 {
+					msg += fmt.Sprintf(" (decayed %d stale entries)", decayed)
+				}
+				fmt.Println(msg)
+			} else {
+				fmt.Printf("  Memory:   ✅ persistent (%s)\n", memoryPath)
+			}
+		}
+	} else {
+		engine = ctx.NewEngine(mgr, engineConfig)
+		fmt.Printf("  Memory:   in-memory (set memory.backend: file for persistence)\n")
+	}
+
+	toolRouter := tools.NewRouter()
+	toolRouter.AllowWrite = allowWrite
+	toolRouter.DryRun = dryRun
+
+	if dryRun {
+		fmt.Printf("  Safety:   🔒 DRY RUN mode (no real execution)\n")
+	} else if allowWrite {
+		fmt.Printf("  Safety:   ⚠️  write operations ENABLED\n")
+	} else {
+		fmt.Printf("  Safety:   🔒 read-only (use --allow-write to enable writes)\n")
+	}
+
+	githubToken := os.Getenv("GITHUB_TOKEN")
+	if githubToken != "" {
+		tools.RegisterGitHub(toolRouter, githubToken)
+		fmt.Printf("  GitHub:   ✅ connected (%d tools)\n", 6)
+	} else {
+		tools.RegisterGitHub(toolRouter, "")
+		fmt.Printf("  GitHub:   ⚠️  no GITHUB_TOKEN (read-only, 60 req/hr limit)\n")
+	}
+
+	for _, tool := range cfg.Tools {
+		if tool.Type == "http" && tool.URI != "" {
+			toolRouter.RegisterHTTP(tool.Name, tools.HTTPToolConfig{
+				Method:  "GET",
+				URL:     tool.URI,
+				Headers: map[string]string{},
+			})
+		}
+	}
+
+	fmt.Printf("  Tools:    %d registered\n", toolRouter.ToolCount())
+
+	agentConfig := runtime.DefaultAgentConfig()
+	agentConfig.Verbose = cfg.Tracing.Enabled
+	agent := runtime.NewAgent(engine, provider, toolRouter, agentConfig)
+
+	if task == "" {
+		fmt.Print("\n  📝 Enter task: ")
+		reader := bufio.NewReader(os.Stdin)
+		input, _ := reader.ReadString('\n')
+		task = strings.TrimSpace(input)
+	}
+
+	if task == "" {
+		fmt.Println("\n  ❌ No task provided. Use: ark run agent.yaml --task \"your task\"")
+		os.Exit(1)
+	}
+
+	fmt.Println()
+	fmt.Println(strings.Repeat("─", 60))
+
+	result := agent.Run("ark-run", task)
+
+	if cfg.Tracing.Enabled {
+		fmt.Println()
+		fmt.Println("  Context Decision Trace:")
+		fmt.Println(engine.TracerRef().PrintTrace(result.TraceID))
+	}
+
+	fmt.Println(strings.Repeat("─", 60))
+	if result.Success {
+		fmt.Println("  ✅ Task completed successfully")
+	} else {
+		fmt.Println("  ❌ Task failed")
+	}
+	fmt.Printf("  Steps: %d | Tokens: %d | Time: %v\n",
+		len(result.Steps), result.TotalTokens, result.TotalTime.Round(time.Millisecond))
+	if result.Output != "" {
+		fmt.Printf("\n  Output:\n  %s\n", result.Output)
+	}
+	fmt.Println()
+
+	if memStore != nil {
+		if err := memStore.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠️  Store flush: %v\n", err)
+		}
+	}
+}
+
+func runDemoLearn() {
+	fmt.Printf(banner, version)
+	fmt.Println("  Proving ARK learns: ranking improves across runs")
+	fmt.Println(strings.Repeat("═", 60))
+
+	storePath := "/tmp/ark-demo-learn.json"
+	os.Remove(storePath)
+
+	query := "search github issues"
+
+	registerTools := func() *ctx.Manager {
+		mgr := ctx.NewManager(ctx.DefaultBudget(200000))
+		// 3 GitHub tools — the engine must learn which one works best
+		mgr.RegisterTool("github-search", "github_search_issues",
+			"search: retrieval operation for github",
+			`{"name":"github_search_issues","description":"Search issues across GitHub repositories"}`)
+		mgr.RegisterTool("github-list", "github_list_issues",
+			"list_issues: retrieval operation for github",
+			`{"name":"github_list_issues","description":"List issues in a specific GitHub repository"}`)
+		mgr.RegisterTool("github-get", "github_get_issue",
+			"get_issue: retrieval operation for github",
+			`{"name":"github_get_issue","description":"Get a single issue by number from GitHub"}`)
+		// Noise tools — should rank lower over time
+		mgr.RegisterTool("slack-0", "slack_send_message",
+			"send_message: operation for slack",
+			`{"name":"slack_send_message","description":"Send a message to a Slack channel"}`)
+		mgr.RegisterTool("jira-0", "jira_search_issues",
+			"search_issues: retrieval operation for jira",
+			`{"name":"jira_search_issues","description":"Search issues in Jira"}`)
+		return mgr
+	}
+
+	fmt.Println()
+	fmt.Println("  ┌─────────────────────────────────────────────────┐")
+	fmt.Println("  │  RUN 1: Fresh start (no history)                │")
+	fmt.Println("  └─────────────────────────────────────────────────┘")
+
+	s1, _ := store.NewJSONFileStore(storePath)
+	mgr1 := registerTools()
+	engine1 := ctx.NewEngineWithStore(mgr1, ctx.DefaultEngineConfig(), s1)
+
+	ranked1 := getRanking(engine1, mgr1, query)
+	printRanking("  Run 1 ranking", ranked1)
+
+	plan1 := engine1.PrepareContext("run1", query)
+	engine1.AdaptContext(plan1, ctx.ExecutionResult{
+		Success: false, ToolUsed: "github-search",
+		ToolsFailed: []string{"github-search"},
+		ErrorType:   ctx.ErrToolFailed, ErrorMsg: "GitHub API timeout",
+		Latency: 5000 * time.Millisecond,
+	})
+	engine1.AdaptContext(plan1, ctx.ExecutionResult{
+		Success: true, ToolUsed: "github-list",
+		Latency: 120 * time.Millisecond,
+	})
+
+	fmt.Println()
+	fmt.Println("  Executed: github-search → FAILED (5000ms timeout)")
+	fmt.Println("  Executed: github-list   → SUCCESS (120ms)")
+
+	time.Sleep(150 * time.Millisecond)
+	s1.Close()
+
+	fmt.Println()
+	fmt.Println("  ┌─────────────────────────────────────────────────┐")
+	fmt.Println("  │  RUN 2: Learning from Run 1                     │")
+	fmt.Println("  └─────────────────────────────────────────────────┘")
+
+	s2, _ := store.NewJSONFileStore(storePath)
+	mgr2 := registerTools()
+	engine2 := ctx.NewEngineWithStore(mgr2, ctx.DefaultEngineConfig(), s2)
+
+	ranked2 := getRanking(engine2, mgr2, query)
+	printRanking("  Run 2 ranking", ranked2)
+	printDiff("  Change from Run 1", ranked1, ranked2)
+
+	plan2 := engine2.PrepareContext("run2", query)
+	engine2.AdaptContext(plan2, ctx.ExecutionResult{
+		Success: true, ToolUsed: "github-list",
+		Latency: 95 * time.Millisecond,
+	})
+	engine2.AdaptContext(plan2, ctx.ExecutionResult{
+		Success: true, ToolUsed: "github-get",
+		Latency: 80 * time.Millisecond,
+	})
+
+	fmt.Println()
+	fmt.Println("  Executed: github-list → SUCCESS (95ms)")
+	fmt.Println("  Executed: github-get  → SUCCESS (80ms)")
+
+	time.Sleep(150 * time.Millisecond)
+	s2.Close()
+
+	fmt.Println()
+	fmt.Println("  ┌─────────────────────────────────────────────────┐")
+	fmt.Println("  │  RUN 3: Compounding knowledge                   │")
+	fmt.Println("  └─────────────────────────────────────────────────┘")
+
+	s3, _ := store.NewJSONFileStore(storePath)
+	mgr3 := registerTools()
+	engine3 := ctx.NewEngineWithStore(mgr3, ctx.DefaultEngineConfig(), s3)
+
+	ranked3 := getRanking(engine3, mgr3, query)
+	printRanking("  Run 3 ranking", ranked3)
+	printDiff("  Change from Run 1", ranked1, ranked3)
+
+	fmt.Println()
+	fmt.Println(strings.Repeat("═", 60))
+	fmt.Println()
+	fmt.Println("  📊 LEARNING PROOF")
+	fmt.Println()
+
+	listRun1 := findScore(ranked1, "github-list")
+	listRun2 := findScore(ranked2, "github-list")
+	listRun3 := findScore(ranked3, "github-list")
+
+	searchRun1 := findScore(ranked1, "github-search")
+	searchRun2 := findScore(ranked2, "github-search")
+	searchRun3 := findScore(ranked3, "github-search")
+
+	fmt.Println("  github-list (the winner):")
+	fmt.Printf("    Run 1: %.3f  (no data)\n", listRun1)
+	fmt.Printf("    Run 2: %.3f  (1 success)\n", listRun2)
+	fmt.Printf("    Run 3: %.3f  (2 successes, improving latency)\n", listRun3)
+	fmt.Printf("    Improvement: +%.1f%%\n", (listRun3-listRun1)/listRun1*100)
+	fmt.Println()
+
+	fmt.Println("  github-search (the loser):")
+	fmt.Printf("    Run 1: %.3f  (no data)\n", searchRun1)
+	fmt.Printf("    Run 2: %.3f  (1 failure)\n", searchRun2)
+	fmt.Printf("    Run 3: %.3f  (still failing)\n", searchRun3)
+	fmt.Printf("    Change: %.1f%%\n", (searchRun3-searchRun1)/searchRun1*100)
+	fmt.Println()
+
+	if listRun3 > listRun1 && searchRun3 < searchRun1 {
+		fmt.Println("  ✅ PROVEN: ARK promotes tools that work, demotes tools that fail.")
+		fmt.Println("     Ranking improved across 3 runs with persistent memory.")
+	} else {
+		fmt.Println("  ⚠️  Learning effect was minimal for this scenario.")
+	}
+
+	fmt.Println()
+	fmt.Println("  This is not caching. This is not heuristics.")
+	fmt.Println("  This is a system that gets smarter every time it runs.")
+	fmt.Println()
+
+	// Cleanup
+	os.Remove(storePath)
+}
+
+type toolScore struct {
+	ID         string
+	Score      float64
+	Success    float64
+	Confidence float64
+	Calls      int
+	Memory     float64
+	Predicted  string
+}
+
+func getRanking(engine *ctx.Engine, mgr *ctx.Manager, query string) []toolScore {
+	plan := engine.PrepareContext("ranking-check", query)
+
+	trace := engine.TracerRef().GetTrace(plan.TraceID)
+	_ = trace
+
+	ranked := engine.RankTools(query)
+
+	scores := make([]toolScore, 0, len(ranked))
+	for _, r := range ranked {
+		scores = append(scores, toolScore{
+			ID:         r.ID,
+			Score:      r.Score,
+			Success:    r.SuccessScore,
+			Confidence: r.ConfidenceScore,
+			Calls:      r.HistoricalCalls,
+			Memory:     r.MemoryBonus,
+			Predicted:  r.Predicted,
+		})
+	}
+
+	for _, id := range plan.ToolsLoaded {
+		mgr.Evict(id)
+	}
+
+	return scores
+}
+
+func printRanking(label string, scores []toolScore) {
+	fmt.Printf("\n%s:\n", label)
+	for i, s := range scores {
+		bar := strings.Repeat("█", int(s.Score*40))
+		learned := ""
+		if s.Calls > 0 {
+			learned = fmt.Sprintf(" [%d calls, %.0f%% success, conf=%.2f]",
+				s.Calls, s.Success*100, s.Confidence)
+		}
+		if s.Memory > 0 {
+			learned += fmt.Sprintf(" [mem=+%.3f]", s.Memory)
+		}
+		fmt.Printf("    %d. %-20s %.3f %s%s\n", i+1, s.ID, s.Score, bar, learned)
+	}
+}
+
+func printDiff(label string, before, after []toolScore) {
+	fmt.Printf("\n%s:\n", label)
+	for _, a := range after {
+		for _, b := range before {
+			if a.ID == b.ID {
+				diff := a.Score - b.Score
+				arrow := "→"
+				if diff > 0.01 {
+					arrow = "↑"
+				} else if diff < -0.01 {
+					arrow = "↓"
+				}
+				if diff != 0 {
+					fmt.Printf("    %s %-20s %+.3f (%s %.3f → %.3f)\n",
+						arrow, a.ID, diff, arrow, b.Score, a.Score)
+				}
+			}
+		}
+	}
+}
+
+func findScore(scores []toolScore, prefix string) float64 {
+	for _, s := range scores {
+		if s.ID == prefix {
+			return s.Score
+		}
+	}
+	return 0
 }

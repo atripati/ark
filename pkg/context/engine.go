@@ -2,10 +2,13 @@ package context
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/atripati/ark/pkg/store"
 )
 
 type Engine struct {
@@ -41,6 +44,19 @@ func NewEngine(mgr *Manager, config EngineConfig) *Engine {
 		ranker: NewToolRanker(),
 		config: config,
 	}
+}
+
+func NewEngineWithStore(mgr *Manager, config EngineConfig, s store.Store) *Engine {
+	return &Engine{
+		mgr:    mgr,
+		tracer: NewTracer(),
+		ranker: NewToolRankerWithStore(s),
+		config: config,
+	}
+}
+
+func (e *Engine) RankTools(query string) []RankedTool {
+	return e.ranker.Rank(query, e.mgr)
 }
 
 func (e *Engine) TracerRef() *Tracer {
@@ -162,7 +178,7 @@ func (e *Engine) AdaptContext(plan *ContextPlan, result ExecutionResult) *Contex
 
 	if result.Success && result.ToolUsed != "" {
 		e.ranker.RecordSuccess(result.ToolUsed, result.Latency)
-		// Record to context memory: "this tool worked only for this query"
+
 		e.ranker.RecordContext(plan.Query, []string{result.ToolUsed})
 	}
 	for _, failed := range result.ToolsFailed {
@@ -245,7 +261,6 @@ func (e *Engine) upgradeToFullSchema(newPlan, oldPlan *ContextPlan) {
 	fullTools := make([]string, 0)
 	for _, id := range oldPlan.ToolsLoaded {
 		e.mgr.Evict(id)
-		// Temporarily disable compression for this load
 		block := e.mgr.GetBlock(id)
 		if block != nil {
 			savedCompressed := block.Compressed
@@ -255,7 +270,6 @@ func (e *Engine) upgradeToFullSchema(newPlan, oldPlan *ContextPlan) {
 			if err := e.mgr.Load(id); err == nil {
 				fullTools = append(fullTools, id)
 			}
-			// Restore compressed version for future use
 			block.Compressed = savedCompressed
 			block.CompressedTokens = savedTokens
 		}
@@ -276,6 +290,7 @@ func (e *Engine) broadenContext(newPlan, oldPlan *ContextPlan) {
 			activeTypes[parts[0]] = true
 		}
 	}
+
 	loaded := 0
 	for id, block := range e.mgr.AllBlocks() {
 		if loaded >= e.config.ExpandStep {
@@ -294,12 +309,11 @@ func (e *Engine) broadenContext(newPlan, oldPlan *ContextPlan) {
 }
 
 func (e *Engine) swapFailedTool(newPlan, oldPlan *ContextPlan, failedTools []string) {
-	// Evict failed tools and load alternatives
+
 	for _, failed := range failedTools {
 		e.mgr.Evict(failed)
 	}
 
-	// Load replacements
 	ranked := e.ranker.Rank(oldPlan.Query, e.mgr)
 	loaded := 0
 	for _, tool := range ranked {
@@ -321,21 +335,14 @@ func (e *Engine) swapFailedTool(newPlan, oldPlan *ContextPlan, failedTools []str
 	}
 }
 
-// ──────────────────────────────────────────────────────────
-// Tool Ranker v2 — Real scoring, not flat guesses
-// ──────────────────────────────────────────────────────────
-
-// ScoreWeights controls how the composite score is calculated.
-// Tuning these changes ARK's decision-making personality.
 type ScoreWeights struct {
-	Relevance  float64 // How well tool matches the query
-	Success    float64 // Historical success rate
-	Latency    float64 // Penalty for slow tools
-	TokenCost  float64 // Penalty for expensive tools
-	Confidence float64 // Bonus for well-known tools (more data)
+	Relevance  float64
+	Success    float64
+	Latency    float64
+	TokenCost  float64
+	Confidence float64
 }
 
-// DefaultWeights returns the recommended scoring weights.
 func DefaultWeights() ScoreWeights {
 	return ScoreWeights{
 		Relevance:  0.45,
@@ -346,60 +353,49 @@ func DefaultWeights() ScoreWeights {
 	}
 }
 
-// ToolRanker scores tools based on multiple signals, not just tag matching.
 type ToolRanker struct {
 	mu         sync.RWMutex
 	successLog map[string]*ToolStats
 	memory     *ContextMemory
 	weights    ScoreWeights
+	store      store.Store
 }
 
-// ToolStats tracks a tool's historical performance.
 type ToolStats struct {
 	TotalCalls       int
 	Successes        int
 	Failures         int
-	ConsecutiveFails int // Track streaks for confidence
+	ConsecutiveFails int
 	AvgLatency       time.Duration
 	LastUsed         time.Time
 	LastErrorType    ErrorType
 }
 
-// SuccessRate returns the tool's success rate (0.0 to 1.0).
 func (ts *ToolStats) SuccessRate() float64 {
 	if ts.TotalCalls == 0 {
-		return 0.5 // Unknown = neutral, not good
+		return 0.5
 	}
 	return float64(ts.Successes) / float64(ts.TotalCalls)
 }
 
-// Confidence returns how much data we have on this tool (0.0 to 1.0).
-// More data = more confident in the success rate.
 func (ts *ToolStats) Confidence() float64 {
-	// Bayesian-inspired: confidence grows with observations
-	// 10 calls = ~0.67 confidence, 30 calls = ~0.86, 100 calls = ~0.95
 	return float64(ts.TotalCalls) / (float64(ts.TotalCalls) + 5.0)
 }
 
-// RankedTool is a tool with its composite score and full breakdown.
 type RankedTool struct {
-	ID    string
-	Score float64
-
-	// Score breakdown — visible in traces
+	ID              string
+	Score           float64
 	RelevanceScore  float64
 	SuccessScore    float64
 	LatencyPenalty  float64
 	CostPenalty     float64
 	ConfidenceScore float64
-	MemoryBonus     float64 // Bonus from context memory
+	MemoryBonus     float64
 
-	// Metadata for decision-making
-	Predicted       string // "high", "medium", "low" confidence prediction
+	Predicted       string
 	HistoricalCalls int
 }
 
-// NewToolRanker creates a new ranker with default weights.
 func NewToolRanker() *ToolRanker {
 	return &ToolRanker{
 		successLog: make(map[string]*ToolStats),
@@ -408,7 +404,51 @@ func NewToolRanker() *ToolRanker {
 	}
 }
 
-// NewToolRankerWithWeights creates a ranker with custom weights.
+func NewToolRankerWithStore(s store.Store) *ToolRanker {
+	r := &ToolRanker{
+		successLog: make(map[string]*ToolStats),
+		memory:     NewContextMemory(),
+		weights:    DefaultWeights(),
+		store:      s,
+	}
+
+	if s == nil {
+		return r
+	}
+
+	records, err := s.LoadAll()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ark/store] load tool stats: %v\n", err)
+	} else {
+		for _, rec := range records {
+			r.successLog[rec.ToolID] = &ToolStats{
+				TotalCalls:       rec.TotalCalls,
+				Successes:        rec.Successes,
+				Failures:         rec.Failures,
+				ConsecutiveFails: rec.ConsecutiveFails,
+				AvgLatency:       time.Duration(rec.AvgLatencyMs) * time.Millisecond,
+				LastUsed:         rec.LastUsed,
+				LastErrorType:    ErrorType(rec.LastErrorType),
+			}
+		}
+	}
+
+	patterns, err := s.LoadPatterns()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ark/store] load patterns: %v\n", err)
+	} else {
+		for _, p := range patterns {
+			r.memory.patterns[p.Pattern] = &MemoryEntry{
+				SuccessfulTools: p.SuccessfulTools,
+				TotalQueries:    p.TotalQueries,
+				LastUsed:        p.LastUsed,
+			}
+		}
+	}
+
+	return r
+}
+
 func NewToolRankerWithWeights(weights ScoreWeights) *ToolRanker {
 	return &ToolRanker{
 		successLog: make(map[string]*ToolStats),
@@ -417,8 +457,6 @@ func NewToolRankerWithWeights(weights ScoreWeights) *ToolRanker {
 	}
 }
 
-// Rank returns tools sorted by composite score (best first).
-// Each tool gets a real, differentiated score based on multiple signals.
 func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -429,7 +467,6 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 	blocks := mgr.AllBlocks()
 	ranked := make([]RankedTool, 0)
 
-	// Find max token count for normalization
 	maxTokens := 1
 	for _, block := range blocks {
 		if block.Type == BlockTool && block.TokenCount > maxTokens {
@@ -444,8 +481,6 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 
 		rt := RankedTool{ID: id}
 
-		// ── 1. RELEVANCE SCORE (0.0 to 1.0) ──
-		// Multi-signal relevance: exact match > prefix match > tag density
 		exactMatches := 0
 		prefixMatches := 0
 		totalQueryWords := len(queryWords)
@@ -455,7 +490,7 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 				if tag == word {
 					exactMatches++
 				} else if len(word) >= 4 && len(tag) >= 4 {
-					// Prefix matching (e.g., "search" matches "searching")
+
 					minLen := len(word)
 					if len(tag) < minLen {
 						minLen = len(tag)
@@ -468,17 +503,15 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 		}
 
 		if exactMatches == 0 && prefixMatches == 0 {
-			continue // No relevance at all → skip
+			continue
 		}
 
-		// Normalize: what fraction of query words matched?
 		if totalQueryWords > 0 {
 			exactRatio := float64(exactMatches) / float64(totalQueryWords)
 			prefixRatio := float64(prefixMatches) / float64(totalQueryWords)
 			rt.RelevanceScore = clamp(exactRatio*1.0+prefixRatio*0.4, 0, 1)
 		}
 
-		// Bonus for tool name containing query words (strong signal)
 		nameLower := strings.ToLower(block.ID)
 		for _, word := range queryWords {
 			if len(word) >= 4 && strings.Contains(nameLower, word) {
@@ -486,45 +519,36 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 			}
 		}
 
-		// ── 2. SUCCESS SCORE (0.0 to 1.0) ──
 		stats, hasHistory := r.successLog[id]
 		if hasHistory && stats.TotalCalls > 0 {
 			rt.SuccessScore = stats.SuccessRate()
 			rt.HistoricalCalls = stats.TotalCalls
 
-			// Penalize tools on a failure streak
 			if stats.ConsecutiveFails >= 3 {
-				rt.SuccessScore *= 0.5 // Halve score for persistent failures
+				rt.SuccessScore *= 0.5
 			}
 		} else {
-			rt.SuccessScore = 0.5 // Unknown = neutral
+			rt.SuccessScore = 0.5
 		}
 
-		// ── 3. LATENCY PENALTY (0.0 to 1.0, lower is better) ──
 		if hasHistory && stats.AvgLatency > 0 {
-			// Normalize latency: 0ms = 0 penalty, 5000ms+ = 1.0 penalty
+
 			latencyMs := float64(stats.AvgLatency.Milliseconds())
 			rt.LatencyPenalty = clamp(latencyMs/5000.0, 0, 1)
 		}
 
-		// ── 4. TOKEN COST PENALTY (0.0 to 1.0, lower is better) ──
 		if block.TokenCount > 0 {
 			rt.CostPenalty = float64(block.TokenCount) / float64(maxTokens)
 		}
 
-		// ── 5. CONFIDENCE SCORE (0.0 to 1.0) ──
-		// How much do we trust the success score?
 		if hasHistory {
 			rt.ConfidenceScore = stats.Confidence()
 		} else {
-			rt.ConfidenceScore = 0.0 // No data = no confidence
+			rt.ConfidenceScore = 0.0
 		}
 
-		// ── 6. CONTEXT MEMORY BONUS ──
-		// "Last time we used this tool for a similar query, it worked"
 		rt.MemoryBonus = r.memory.QueryBonus(id, queryWords)
 
-		// ── COMPOSITE SCORE ──
 		rt.Score = (rt.RelevanceScore * r.weights.Relevance) +
 			(rt.SuccessScore * r.weights.Success) -
 			(rt.LatencyPenalty * r.weights.Latency) -
@@ -532,7 +556,6 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 			(rt.ConfidenceScore * r.weights.Confidence) +
 			rt.MemoryBonus
 
-		// ── PREDICTION ──
 		rt.Predicted = predictOutcome(rt)
 
 		ranked = append(ranked, rt)
@@ -545,7 +568,6 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 	return ranked
 }
 
-// RecordSuccess logs a successful tool execution.
 func (r *ToolRanker) RecordSuccess(toolID string, latency time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -553,17 +575,17 @@ func (r *ToolRanker) RecordSuccess(toolID string, latency time.Duration) {
 	stats := r.getOrCreate(toolID)
 	stats.TotalCalls++
 	stats.Successes++
-	stats.ConsecutiveFails = 0 // Reset streak
+	stats.ConsecutiveFails = 0
 	stats.LastUsed = time.Now()
 	if stats.AvgLatency == 0 {
 		stats.AvgLatency = latency
 	} else {
-		// Exponential moving average (recent latency weighted more)
 		stats.AvgLatency = time.Duration(float64(stats.AvgLatency)*0.7 + float64(latency)*0.3)
 	}
+
+	r.persist(toolID, stats)
 }
 
-// RecordFailure logs a failed tool execution.
 func (r *ToolRanker) RecordFailure(toolID string, errType ErrorType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -574,17 +596,21 @@ func (r *ToolRanker) RecordFailure(toolID string, errType ErrorType) {
 	stats.ConsecutiveFails++
 	stats.LastUsed = time.Now()
 	stats.LastErrorType = errType
+
+	r.persist(toolID, stats)
 }
 
-// RecordContext records which tools worked for a query pattern.
-// This feeds the context memory for future predictions.
 func (r *ToolRanker) RecordContext(query string, successfulTools []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.memory.Record(query, successfulTools)
+
+	pattern := extractPattern(query)
+	if entry, ok := r.memory.patterns[pattern]; ok {
+		r.persistPattern(pattern, entry)
+	}
 }
 
-// GetStats returns the stats for a tool (for tracing/debugging).
 func (r *ToolRanker) GetStats(toolID string) *ToolStats {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -603,32 +629,54 @@ func (r *ToolRanker) getOrCreate(id string) *ToolStats {
 	return s
 }
 
-// ──────────────────────────────────────────────────────────
-// Context Memory — ARK learns what works
-// ──────────────────────────────────────────────────────────
+func (r *ToolRanker) persist(toolID string, stats *ToolStats) {
+	if r.store == nil {
+		return
+	}
+	if err := r.store.Save(store.ToolStatsRecord{
+		ToolID:           toolID,
+		TotalCalls:       stats.TotalCalls,
+		Successes:        stats.Successes,
+		Failures:         stats.Failures,
+		ConsecutiveFails: stats.ConsecutiveFails,
+		AvgLatencyMs:     stats.AvgLatency.Milliseconds(),
+		LastUsed:         stats.LastUsed,
+		LastErrorType:    int(stats.LastErrorType),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "[ark/store] persist tool %s: %v\n", toolID, err)
+	}
+}
 
-// ContextMemory remembers which tools succeeded for similar queries.
-// This is the "ARK gets smarter over time" mechanism.
+func (r *ToolRanker) persistPattern(pattern string, entry *MemoryEntry) {
+	if r.store == nil {
+		return
+	}
+	if err := r.store.SavePattern(store.QueryPatternRecord{
+		Pattern:         pattern,
+		SuccessfulTools: entry.SuccessfulTools,
+		TotalQueries:    entry.TotalQueries,
+		LastUsed:        entry.LastUsed,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "[ark/store] persist pattern %q: %v\n", pattern, err)
+	}
+}
+
 type ContextMemory struct {
-	// Maps query pattern → tool IDs that succeeded
 	patterns map[string]*MemoryEntry
 }
 
-// MemoryEntry records what worked for a query pattern.
 type MemoryEntry struct {
-	SuccessfulTools map[string]int // tool ID → success count
+	SuccessfulTools map[string]int
 	TotalQueries    int
 	LastUsed        time.Time
 }
 
-// NewContextMemory creates a new context memory.
 func NewContextMemory() *ContextMemory {
 	return &ContextMemory{
 		patterns: make(map[string]*MemoryEntry),
 	}
 }
 
-// Record stores a successful tool combination for a query.
 func (cm *ContextMemory) Record(query string, tools []string) {
 	pattern := extractPattern(query)
 	entry, ok := cm.patterns[pattern]
@@ -645,12 +693,9 @@ func (cm *ContextMemory) Record(query string, tools []string) {
 	}
 }
 
-// QueryBonus returns a score bonus for a tool based on memory.
-// If this tool has succeeded for similar queries before, it gets a boost.
 func (cm *ContextMemory) QueryBonus(toolID string, queryWords []string) float64 {
 	bestBonus := 0.0
 	for pattern, entry := range cm.patterns {
-		// Check if this pattern is similar to current query
 		patternWords := strings.Fields(pattern)
 		overlap := 0
 		for _, pw := range patternWords {
@@ -666,10 +711,9 @@ func (cm *ContextMemory) QueryBonus(toolID string, queryWords []string) float64 
 
 		similarity := float64(overlap) / float64(max(len(patternWords), len(queryWords)))
 
-		// Check if this tool was successful for this pattern
 		if count, ok := entry.SuccessfulTools[toolID]; ok && entry.TotalQueries > 0 {
 			successRate := float64(count) / float64(entry.TotalQueries)
-			bonus := similarity * successRate * 0.15 // Max 0.15 bonus
+			bonus := similarity * successRate * 0.15
 			if bonus > bestBonus {
 				bestBonus = bonus
 			}
@@ -678,8 +722,6 @@ func (cm *ContextMemory) QueryBonus(toolID string, queryWords []string) float64 
 	return bestBonus
 }
 
-// extractPattern normalizes a query into a pattern for matching.
-// Strips stop words and sorts remaining words for order-independent matching.
 func extractPattern(query string) string {
 	stopWords := map[string]bool{
 		"the": true, "a": true, "an": true, "is": true, "are": true,
@@ -699,24 +741,16 @@ func extractPattern(query string) string {
 	return strings.Join(meaningful, " ")
 }
 
-// ──────────────────────────────────────────────────────────
-// Prediction — choose better before failing
-// ──────────────────────────────────────────────────────────
-
-// predictOutcome estimates likelihood of success based on all signals.
 func predictOutcome(rt RankedTool) string {
-	// High confidence: good relevance + good history + enough data
 	if rt.RelevanceScore >= 0.4 && rt.SuccessScore >= 0.7 && rt.ConfidenceScore >= 0.5 {
 		return "high"
 	}
-	// Low confidence: poor history or failure streak
+
 	if rt.SuccessScore < 0.3 || (rt.HistoricalCalls > 5 && rt.SuccessScore < 0.5) {
 		return "low"
 	}
 	return "medium"
 }
-
-// ── Utilities ──
 
 func clamp(v, lo, hi float64) float64 {
 	if v < lo {
@@ -728,18 +762,12 @@ func clamp(v, lo, hi float64) float64 {
 	return v
 }
 
-// ──────────────────────────────────────────────────────────
-// Context Tracer — full decision audit trail
-// ──────────────────────────────────────────────────────────
-
-// Tracer records every context decision for debugging and observability.
 type Tracer struct {
 	mu     sync.Mutex
 	traces map[string]*Trace
 	nextID int
 }
 
-// Trace represents the full audit trail for a single task execution.
 type Trace struct {
 	ID        string
 	TaskID    string
@@ -749,27 +777,25 @@ type Trace struct {
 	Duration  time.Duration
 }
 
-// TraceEvent is a single recorded decision or observation.
 type TraceEvent struct {
 	Time    time.Time
 	Type    TraceEventType
 	Message string
-	Data    string // Optional structured data
+	Data    string
 }
 
-// TraceEventType categorizes trace events.
 type TraceEventType int
 
 const (
-	EventToolRanking       TraceEventType = iota // Tools were scored and ranked
-	EventToolLoaded                              // A tool was loaded into context
-	EventToolEvicted                             // A tool was evicted
-	EventContextPrepared                         // Initial context was assembled
-	EventContextAdapted                          // Context was modified after feedback
-	EventExecutionResult                         // Model execution outcome
-	EventSchemaUpgrade                           // Compressed → full schema upgrade
-	EventTraceComplete                           // Task finished
-	EventMaxRetriesReached                       // Gave up after max retries
+	EventToolRanking TraceEventType = iota
+	EventToolLoaded
+	EventToolEvicted
+	EventContextPrepared
+	EventContextAdapted
+	EventExecutionResult
+	EventSchemaUpgrade
+	EventTraceComplete
+	EventMaxRetriesReached
 )
 
 func (t TraceEventType) String() string {
@@ -784,14 +810,12 @@ func (t TraceEventType) String() string {
 	return "unknown"
 }
 
-// NewTracer creates a new tracer.
 func NewTracer() *Tracer {
 	return &Tracer{
 		traces: make(map[string]*Trace),
 	}
 }
 
-// StartTrace begins recording a new task execution.
 func (t *Tracer) StartTrace(taskID, query string) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -810,7 +834,6 @@ func (t *Tracer) StartTrace(taskID, query string) string {
 	return traceID
 }
 
-// Record adds an event to a trace.
 func (t *Tracer) Record(traceID string, event TraceEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -824,14 +847,12 @@ func (t *Tracer) Record(traceID string, event TraceEvent) {
 	trace.Events = append(trace.Events, event)
 }
 
-// GetTrace returns a trace by ID.
 func (t *Tracer) GetTrace(traceID string) *Trace {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.traces[traceID]
 }
 
-// AllTraces returns all recorded traces.
 func (t *Tracer) AllTraces() []*Trace {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -842,7 +863,6 @@ func (t *Tracer) AllTraces() []*Trace {
 	return traces
 }
 
-// PrintTrace outputs a human-readable trace to stdout.
 func (t *Tracer) PrintTrace(traceID string) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -879,39 +899,27 @@ func (t *Tracer) PrintTrace(traceID string) string {
 	return sb.String()
 }
 
-// ──────────────────────────────────────────────────────────
-// Helper methods added to Manager for Engine support
-// ──────────────────────────────────────────────────────────
-
-// IsActive checks if a block is currently loaded.
 func (m *Manager) IsActive(id string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.active[id]
 }
 
-// GetBlock returns a registered block by ID (or nil).
 func (m *Manager) GetBlock(id string) *ContextBlock {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.registry[id]
 }
 
-// AllBlocks returns all registered blocks.
 func (m *Manager) AllBlocks() map[string]*ContextBlock {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	// Return a copy to avoid race conditions
 	copy := make(map[string]*ContextBlock, len(m.registry))
 	for k, v := range m.registry {
 		copy[k] = v
 	}
 	return copy
 }
-
-// ──────────────────────────────────────────────────────────
-// Utilities
-// ──────────────────────────────────────────────────────────
 
 func formatRankedTools(ranked []RankedTool) string {
 	if len(ranked) == 0 {
@@ -924,8 +932,16 @@ func formatRankedTools(ranked []RankedTool) string {
 	parts := make([]string, limit)
 	for i := 0; i < limit; i++ {
 		r := ranked[i]
-		parts[i] = fmt.Sprintf("%s(%.2f [r=%.2f s=%.2f p=%s])",
-			r.ID, r.Score, r.RelevanceScore, r.SuccessScore, r.Predicted)
+
+		learned := ""
+		if r.HistoricalCalls > 0 {
+			learned = fmt.Sprintf(" calls=%d", r.HistoricalCalls)
+		}
+		if r.MemoryBonus > 0 {
+			learned += fmt.Sprintf(" mem=+%.2f", r.MemoryBonus)
+		}
+		parts[i] = fmt.Sprintf("%s(%.2f [r=%.2f s=%.2f c=%.2f p=%s%s])",
+			r.ID, r.Score, r.RelevanceScore, r.SuccessScore, r.ConfidenceScore, r.Predicted, learned)
 	}
 	result := strings.Join(parts, ", ")
 	if len(ranked) > limit {
