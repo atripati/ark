@@ -9,7 +9,7 @@ import (
 
 const (
 	githubAPI    = "https://api.github.com"
-	maxListItems = 5
+	maxListItems = 10
 )
 
 func RegisterGitHub(router *Router, token string) {
@@ -84,13 +84,13 @@ func (g *githubTools) headers() map[string]string {
 func (g *githubTools) listRepos(params map[string]interface{}) (string, error) {
 	user, _ := params["user"].(string)
 
-	url := githubAPI + "/user/repos?per_page=5&sort=updated"
+	url := githubAPI + "/user/repos?per_page=10&sort=updated"
 	if user != "" {
-		url = fmt.Sprintf("%s/users/%s/repos?per_page=5&sort=updated", githubAPI, user)
+		url = fmt.Sprintf("%s/users/%s/repos?per_page=10&sort=updated", githubAPI, user)
 	}
 
 	if perPage, ok := params["per_page"]; ok {
-		url = strings.Replace(url, "per_page=5", fmt.Sprintf("per_page=%v", perPage), 1)
+		url = strings.Replace(url, "per_page=10", fmt.Sprintf("per_page=%v", perPage), 1)
 	}
 	if sort, ok := params["sort"]; ok {
 		url = strings.Replace(url, "sort=updated", fmt.Sprintf("sort=%v", sort), 1)
@@ -141,7 +141,7 @@ func (g *githubTools) listIssues(params map[string]interface{}) (string, error) 
 
 	result, err := g.exec.Execute(HTTPToolConfig{
 		Method:  "GET",
-		URL:     fmt.Sprintf("%s/repos/%s/%s/issues?state=%s&per_page=5", githubAPI, owner, repo, state),
+		URL:     fmt.Sprintf("%s/repos/%s/%s/issues?state=%s&per_page=10", githubAPI, owner, repo, state),
 		Headers: g.headers(),
 	}, nil)
 	if err != nil {
@@ -201,7 +201,7 @@ func (g *githubTools) listPulls(params map[string]interface{}) (string, error) {
 
 	result, err := g.exec.Execute(HTTPToolConfig{
 		Method:  "GET",
-		URL:     fmt.Sprintf("%s/repos/%s/%s/pulls?state=%s&per_page=5", githubAPI, owner, repo, state),
+		URL:     fmt.Sprintf("%s/repos/%s/%s/pulls?state=%s&per_page=10", githubAPI, owner, repo, state),
 		Headers: g.headers(),
 	}, nil)
 	if err != nil {

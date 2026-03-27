@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -8,7 +9,6 @@ import (
 	ctx "github.com/atripati/ark/pkg/context"
 )
 
-// Implement this for your model provider (Anthropic, OpenAI, Ollama, etc.)
 type Executor interface {
 	Execute(context string, task string) (*ModelResponse, error)
 }
@@ -68,9 +68,10 @@ type TaskResult struct {
 	TotalTime   time.Duration
 	TraceID     string
 }
+
 type StepRecord struct {
 	Step     int
-	Action   string // "think", "tool_call", "adapt", "complete"
+	Action   string
 	ToolName string
 	Input    string
 	Output   string
@@ -100,12 +101,18 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			len(plan.ToolsLoaded), plan.TokensUsed, plan.Strategy)
 	}
 
+	toolContext := a.engine.Manager().Render()
+	systemPrompt := buildSystemPrompt(toolContext, plan.ToolsLoaded)
+
+	var history []message
+	history = append(history, message{Role: "user", Content: task})
+
 	for step := 0; step < a.config.MaxSteps; step++ {
 		stepStart := time.Now()
 
-		contextStr := a.engine.Manager().Render()
+		prompt := buildPrompt(history)
 
-		response, err := a.executor.Execute(contextStr, task)
+		response, err := a.executor.Execute(systemPrompt, prompt)
 		if err != nil {
 			record := StepRecord{
 				Step:     step + 1,
@@ -118,6 +125,7 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			if a.config.Verbose {
 				fmt.Printf("├─ Step %d: ERROR — %v\n", step+1, err)
 			}
+
 			execResult := ctx.ExecutionResult{
 				Success:   false,
 				ErrorType: ctx.ErrToolFailed,
@@ -126,6 +134,8 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			newPlan := a.engine.AdaptContext(plan, execResult)
 			if newPlan != nil {
 				plan = newPlan
+				toolContext = a.engine.Manager().Render()
+				systemPrompt = buildSystemPrompt(toolContext, plan.ToolsLoaded)
 				if a.config.Verbose {
 					fmt.Printf("├─ Adapted: %s → loaded %d tools (%d tokens)\n",
 						newPlan.Strategy, len(newPlan.ToolsLoaded), newPlan.TokensUsed)
@@ -136,88 +146,123 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 		}
 
 		result.TotalTokens += response.TokensUsed
-		if response.ToolCall == nil {
+
+		var toolCall *ToolCall
+		var finalText string
+
+		if response.ToolCall != nil {
+			toolCall = response.ToolCall
+		} else {
+			parsed := parseResponse(response.Text)
+			if parsed.toolCall != nil {
+				toolCall = parsed.toolCall
+			} else {
+				finalText = parsed.text
+			}
+		}
+
+		if toolCall != nil {
+			if a.config.Verbose {
+				fmt.Printf("├─ Step %d: TOOL_CALL — %s\n", step+1, toolCall.Name)
+			}
+
+			toolErr := a.tools.Handle(toolCall)
+
 			record := StepRecord{
 				Step:     step + 1,
-				Action:   "complete",
-				Output:   response.Text,
+				Action:   "tool_call",
+				ToolName: toolCall.Name,
+				Input:    fmt.Sprintf("%v", toolCall.Params),
 				Tokens:   response.TokensUsed,
-				Duration: response.Latency,
+				Duration: time.Since(stepStart),
 				Strategy: plan.Strategy,
 			}
-			result.Steps = append(result.Steps, record)
-			result.Success = true
-			result.Output = response.Text
 
-			if a.config.Verbose {
-				outputPreview := response.Text
-				if len(outputPreview) > 80 {
-					outputPreview = outputPreview[:80] + "..."
+			if toolErr != nil {
+				record.Output = toolErr.Error()
+				record.Action = "tool_call_retry"
+
+				if a.config.Verbose {
+					fmt.Printf("│  ↳ Failed: %v\n", toolErr)
 				}
-				fmt.Printf("├─ Step %d: COMPLETE — %s\n", step+1, outputPreview)
+
+				execResult := ctx.ExecutionResult{
+					Success:     false,
+					ToolUsed:    toolCall.Name,
+					ToolsFailed: []string{toolCall.Name},
+					ErrorType:   ctx.ErrToolFailed,
+					ErrorMsg:    toolErr.Error(),
+					TokensUsed:  response.TokensUsed,
+					Latency:     response.Latency,
+				}
+				newPlan := a.engine.AdaptContext(plan, execResult)
+				if newPlan != nil {
+					plan = newPlan
+					toolContext = a.engine.Manager().Render()
+					systemPrompt = buildSystemPrompt(toolContext, plan.ToolsLoaded)
+					if a.config.Verbose {
+						fmt.Printf("├─ Adapted: %s → %d tools\n",
+							newPlan.Strategy, len(newPlan.ToolsLoaded))
+					}
+				}
+
+				history = append(history, message{
+					Role:    "assistant",
+					Content: fmt.Sprintf("I tried to call %s but it failed: %s", toolCall.Name, toolErr.Error()),
+				})
+			} else {
+				record.Output = toolCall.Result
+
+				if a.config.Verbose {
+					preview := toolCall.Result
+					if len(preview) > 80 {
+						preview = preview[:80] + "..."
+					}
+					fmt.Printf("│  ↳ Result: %s\n", preview)
+				}
+
+				execResult := ctx.ExecutionResult{
+					Success:    true,
+					ToolUsed:   toolCall.Name,
+					TokensUsed: response.TokensUsed,
+					Latency:    response.Latency,
+				}
+				a.engine.AdaptContext(plan, execResult)
+
+				history = append(history, message{
+					Role:    "assistant",
+					Content: fmt.Sprintf("I called %s and got results.", toolCall.Name),
+				})
+				history = append(history, message{
+					Role: "user",
+					Content: fmt.Sprintf("Tool %s returned this data:\n%s\n\nUsing ONLY the data above, answer the original question. Do NOT make up information.",
+						toolCall.Name, toolCall.Result),
+				})
 			}
-			break
+
+			result.Steps = append(result.Steps, record)
+			continue
 		}
-
-		toolCall := response.ToolCall
-
-		if a.config.Verbose {
-			fmt.Printf("├─ Step %d: TOOL_CALL — %s\n", step+1, toolCall.Name)
-		}
-
-		toolErr := a.tools.Handle(toolCall)
-
 		record := StepRecord{
 			Step:     step + 1,
-			Action:   "tool_call",
-			ToolName: toolCall.Name,
-			Input:    fmt.Sprintf("%v", toolCall.Params),
+			Action:   "complete",
+			Output:   finalText,
 			Tokens:   response.TokensUsed,
-			Duration: time.Since(stepStart),
+			Duration: response.Latency,
 			Strategy: plan.Strategy,
 		}
-
-		if toolErr != nil {
-			record.Output = toolErr.Error()
-			execResult := ctx.ExecutionResult{
-				Success:     false,
-				ToolUsed:    toolCall.Name,
-				ToolsFailed: []string{toolCall.Name},
-				ErrorType:   ctx.ErrToolFailed,
-				ErrorMsg:    toolErr.Error(),
-				TokensUsed:  response.TokensUsed,
-				Latency:     response.Latency,
-			}
-
-			newPlan := a.engine.AdaptContext(plan, execResult)
-			if newPlan != nil {
-				plan = newPlan
-				record.Action = "tool_call_retry"
-				if a.config.Verbose {
-					fmt.Printf("│  ↳ Failed, adapting: %s → %d tools\n",
-						newPlan.Strategy, len(newPlan.ToolsLoaded))
-				}
-			}
-		} else {
-			record.Output = toolCall.Result
-			execResult := ctx.ExecutionResult{
-				Success:    true,
-				ToolUsed:   toolCall.Name,
-				TokensUsed: response.TokensUsed,
-				Latency:    response.Latency,
-			}
-			a.engine.AdaptContext(plan, execResult)
-
-			if a.config.Verbose {
-				outputPreview := toolCall.Result
-				if len(outputPreview) > 60 {
-					outputPreview = outputPreview[:60] + "..."
-				}
-				fmt.Printf("│  ↳ Result: %s\n", outputPreview)
-			}
-		}
-
 		result.Steps = append(result.Steps, record)
+		result.Success = true
+		result.Output = finalText
+
+		if a.config.Verbose {
+			preview := finalText
+			if len(preview) > 80 {
+				preview = preview[:80] + "..."
+			}
+			fmt.Printf("├─ Step %d: COMPLETE — %s\n", step+1, preview)
+		}
+		break
 	}
 
 	result.TotalTime = time.Since(startTime)
@@ -229,6 +274,150 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 	}
 
 	return result
+}
+
+func buildSystemPrompt(toolContext string, loadedTools []string) string {
+	if len(loadedTools) == 0 {
+		return "You are a helpful assistant. Answer the user's question directly and concisely."
+	}
+
+	var sb strings.Builder
+	sb.WriteString("You are an AI agent with access to real tools. You MUST use tools to answer questions about real-world data (GitHub repos, issues, users, etc.). Do NOT guess or make up information — always call the appropriate tool first.\n\n")
+
+	sb.WriteString(toolContext)
+	sb.WriteString("\n\n")
+
+	sb.WriteString("TO CALL A TOOL, respond with EXACTLY this format on a line by itself:\n")
+	sb.WriteString("TOOL_CALL: tool_name({\"param1\": \"value1\", \"param2\": \"value2\"})\n\n")
+
+	sb.WriteString("EXAMPLES:\n")
+	sb.WriteString("TOOL_CALL: github_list_repos({\"user\": \"atripati\"})\n")
+	sb.WriteString("TOOL_CALL: github_get_repo({\"owner\": \"atripati\", \"repo\": \"ark\"})\n")
+	sb.WriteString("TOOL_CALL: github_list_issues({\"owner\": \"atripati\", \"repo\": \"ark\"})\n\n")
+
+	sb.WriteString("RULES:\n")
+	sb.WriteString("1. If asked about GitHub repos, issues, PRs, or users → ALWAYS call a github tool first.\n")
+	sb.WriteString("2. Use ONLY the exact tool names shown above.\n")
+	sb.WriteString("3. ONE tool call per response.\n")
+	sb.WriteString("4. After receiving tool results, summarize them for the user.\n")
+	sb.WriteString("5. NEVER fabricate repository names, issue numbers, or user data.\n")
+
+	return sb.String()
+}
+
+type message struct {
+	Role    string
+	Content string
+}
+
+func buildPrompt(history []message) string {
+	if len(history) == 1 {
+		return history[0].Content
+	}
+
+	var sb strings.Builder
+	for _, msg := range history {
+		switch msg.Role {
+		case "user":
+			sb.WriteString("User: ")
+		case "assistant":
+			sb.WriteString("Assistant: ")
+		}
+		sb.WriteString(msg.Content)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("Assistant: ")
+	return sb.String()
+}
+
+type parsedResponse struct {
+	text     string
+	toolCall *ToolCall
+}
+
+func parseResponse(text string) parsedResponse {
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "TOOL_CALL:") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "TOOL_CALL:"))
+			return parseToolCallLine(rest)
+		}
+		if strings.HasPrefix(trimmed, "TOOL_CALL ") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "TOOL_CALL "))
+			return parseToolCallLine(rest)
+		}
+	}
+
+	return parsedResponse{text: text}
+}
+
+func parseToolCallLine(s string) parsedResponse {
+	parenIdx := strings.Index(s, "(")
+	if parenIdx < 0 {
+		toolName := strings.TrimSpace(s)
+		if toolName != "" {
+			return parsedResponse{
+				toolCall: &ToolCall{
+					Name:   toolName,
+					Params: make(map[string]interface{}),
+				},
+			}
+		}
+		return parsedResponse{text: s}
+	}
+
+	toolName := strings.TrimSpace(s[:parenIdx])
+
+	closeIdx := strings.LastIndex(s, ")")
+	if closeIdx <= parenIdx {
+		closeIdx = len(s)
+	}
+	paramsStr := s[parenIdx+1 : closeIdx]
+
+	params := parseParams(paramsStr)
+
+	return parsedResponse{
+		toolCall: &ToolCall{
+			Name:   toolName,
+			Params: params,
+		},
+	}
+}
+
+func parseParams(s string) map[string]interface{} {
+	s = strings.TrimSpace(s)
+	params := make(map[string]interface{})
+
+	if s == "" {
+		return params
+	}
+
+	// Try JSON first
+	if strings.HasPrefix(s, "{") {
+		if err := json.Unmarshal([]byte(s), &params); err == nil {
+			return params
+		}
+	}
+
+	// Fallback: key=value pairs
+	pairs := strings.Split(s, ",")
+	for _, pair := range pairs {
+		pair = strings.TrimSpace(pair)
+		if eqIdx := strings.Index(pair, "="); eqIdx > 0 {
+			key := strings.TrimSpace(pair[:eqIdx])
+			val := strings.TrimSpace(pair[eqIdx+1:])
+			val = strings.Trim(val, "\"'")
+			params[key] = val
+		} else if pair != "" {
+			if _, exists := params["query"]; !exists {
+				params["query"] = pair
+			}
+		}
+	}
+
+	return params
 }
 
 type MockExecutor struct {
@@ -292,23 +481,18 @@ func (m *MockToolHandler) Handle(call *ToolCall) error {
 	return nil
 }
 
-// it will show two scenarios:
-//  1. Happy path: load tools → call → succeed
-//  2. Failure recovery: load tools → fail → adapt context → retry → succeed
 func RunDemo(mgr *ctx.Manager) {
 	fmt.Println()
 	fmt.Println(strings.Repeat("═", 60))
 	fmt.Println("  ARK Agent Runtime Demo")
 	fmt.Println(strings.Repeat("═", 60))
 
-	// ── Scenario 1: Happy path ──
 	fmt.Println()
 	fmt.Println("  ── Scenario 1: Happy Path ──")
 	fmt.Println("  Task: Create a pull request on github")
 	fmt.Println()
 
 	engine1 := ctx.NewEngine(mgr, ctx.DefaultEngineConfig())
-
 	executor1 := &MockExecutor{
 		Responses: []MockResponse{
 			{ToolName: "github_create_pr", Params: map[string]interface{}{
@@ -318,7 +502,6 @@ func RunDemo(mgr *ctx.Manager) {
 			{Text: "Done! PR #42 is open at github.com/atripati/ark/pull/42"},
 		},
 	}
-
 	tools1 := &MockToolHandler{
 		Results: map[string]string{
 			"github_create_pr": `{"id": 42, "url": "https://github.com/atripati/ark/pull/42", "state": "open"}`,
@@ -332,13 +515,11 @@ func RunDemo(mgr *ctx.Manager) {
 	fmt.Println("  Trace:")
 	fmt.Println(engine1.TracerRef().PrintTrace(result1.TraceID))
 
-	// ── Scenario 2: Failure → Adapt → Retry ──
 	fmt.Println("  ── Scenario 2: Failure → Adapt → Retry ──")
 	fmt.Println("  Task: Search jira issues (tool fails first, engine adapts)")
 	fmt.Println()
 
 	engine2 := ctx.NewEngine(mgr, ctx.DefaultEngineConfig())
-
 	executor2 := &MockExecutor{
 		Responses: []MockResponse{
 			{ToolName: "jira_search_issues", Params: map[string]interface{}{
@@ -350,7 +531,6 @@ func RunDemo(mgr *ctx.Manager) {
 			{Text: "Found 3 open issues assigned to you: ARK-101, ARK-102, ARK-103"},
 		},
 	}
-
 	tools2 := &MockToolHandler{
 		Results: map[string]string{
 			"jira_list_issues": `[{"key":"ARK-101","summary":"Fix token counting"},{"key":"ARK-102","summary":"Add MCP connector"},{"key":"ARK-103","summary":"Write docs"}]`,
@@ -367,7 +547,6 @@ func RunDemo(mgr *ctx.Manager) {
 	fmt.Println("  Trace:")
 	fmt.Println(engine2.TracerRef().PrintTrace(result2.TraceID))
 
-	// Summary
 	fmt.Println(strings.Repeat("─", 60))
 	fmt.Printf("  Scenario 1: success=%v, steps=%d, strategy=minimal\n",
 		result1.Success, len(result1.Steps))

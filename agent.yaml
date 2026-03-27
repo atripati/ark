@@ -1,0 +1,43 @@
+# ARK Agent Definition
+# This file defines your agent's behavior, tools, and context strategy.
+
+name: my-agent
+version: "0.1"
+
+# Model configuration (swap providers with a single line change)
+model:
+  provider: ollama  # anthropic | openai | ollama
+  name: llama3
+  max_tokens: 4096
+
+# Context budget (ARK's killer feature)
+# Instead of dumping all tool schemas into the prompt,
+# ARK dynamically loads only what's relevant.
+context:
+  total_tokens: 200000
+  strategy: adaptive  # adaptive | static | manual
+  tool_budget: 10%    # vs 30-50% with raw MCP
+  memory_budget: 10%
+  conversation_budget: 35%
+
+# Tools available to this agent
+tools:
+  - name: github
+    type: mcp
+    uri: "https://github.mcp.example.com"
+    # ARK will compress these schemas and lazy-load them
+    
+  - name: search
+    type: function
+    description: "Search the web"
+    
+# Memory configuration
+memory:
+  backend: file  # file | memory (sqlite coming soon)
+  shared: false    # Enable shared memory graph for multi-agent
+  path: "./ark-memory.db"
+
+# Observability (built-in, always on)
+tracing:
+  enabled: true
+  output: stdout   # stdout | file | otlp
