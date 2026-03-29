@@ -59,6 +59,10 @@ func (e *Engine) RankTools(query string) []RankedTool {
 	return e.ranker.Rank(query, e.mgr)
 }
 
+func (e *Engine) RecordToolCost(toolID string, costUSD float64) {
+	e.ranker.RecordCost(toolID, costUSD)
+}
+
 func (e *Engine) TracerRef() *Tracer {
 	return e.tracer
 }
@@ -345,10 +349,10 @@ type ScoreWeights struct {
 
 func DefaultWeights() ScoreWeights {
 	return ScoreWeights{
-		Relevance:  0.45,
+		Relevance:  0.40,
 		Success:    0.30,
-		Latency:    0.10,
-		TokenCost:  0.05,
+		Latency:    0.05,
+		TokenCost:  0.15,
 		Confidence: 0.10,
 	}
 }
@@ -367,6 +371,7 @@ type ToolStats struct {
 	Failures         int
 	ConsecutiveFails int
 	AvgLatency       time.Duration
+	AvgCost          float64
 	LastUsed         time.Time
 	LastErrorType    ErrorType
 }
@@ -389,6 +394,7 @@ type RankedTool struct {
 	SuccessScore    float64
 	LatencyPenalty  float64
 	CostPenalty     float64
+	ActualCostUSD   float64
 	ConfidenceScore float64
 	MemoryBonus     float64
 
@@ -467,7 +473,6 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 	blocks := mgr.AllBlocks()
 	ranked := make([]RankedTool, 0)
 
-	// Collect and sort IDs for deterministic iteration (map order is random)
 	blockIDs := make([]string, 0, len(blocks))
 	for id := range blocks {
 		blockIDs = append(blockIDs, id)
@@ -545,7 +550,10 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 			rt.LatencyPenalty = clamp(latencyMs/5000.0, 0, 1)
 		}
 
-		if block.TokenCount > 0 {
+		if hasHistory && stats.AvgCost > 0 {
+			rt.ActualCostUSD = stats.AvgCost
+			rt.CostPenalty = clamp(stats.AvgCost/0.01, 0, 1)
+		} else if block.TokenCount > 0 {
 			rt.CostPenalty = float64(block.TokenCount) / float64(maxTokens)
 		}
 
@@ -569,7 +577,6 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 		ranked = append(ranked, rt)
 	}
 
-	// Stable sort with ID tiebreaker — same input always produces same ranking
 	sort.SliceStable(ranked, func(i, j int) bool {
 		if ranked[i].Score != ranked[j].Score {
 			return ranked[i].Score > ranked[j].Score
@@ -632,6 +639,17 @@ func (r *ToolRanker) GetStats(toolID string) *ToolStats {
 	return nil
 }
 
+func (r *ToolRanker) RecordCost(toolID string, costUSD float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	stats := r.getOrCreate(toolID)
+	if stats.AvgCost == 0 {
+		stats.AvgCost = costUSD
+	} else {
+		stats.AvgCost = stats.AvgCost*0.7 + costUSD*0.3
+	}
+}
+
 func (r *ToolRanker) getOrCreate(id string) *ToolStats {
 	if s, ok := r.successLog[id]; ok {
 		return s
@@ -663,8 +681,6 @@ func (r *ToolRanker) persistPattern(pattern string, entry *MemoryEntry) {
 	if r.store == nil {
 		return
 	}
-	// CRITICAL: deep-copy the map. entry.SuccessfulTools is mutable and
-	// shared with the engine. The store worker runs asynchronously.
 	toolsCopy := make(map[string]int, len(entry.SuccessfulTools))
 	for k, v := range entry.SuccessfulTools {
 		toolsCopy[k] = v
@@ -730,11 +746,8 @@ func (cm *ContextMemory) QueryBonus(toolID string, queryWords []string) float64 
 		similarity := float64(overlap) / float64(max(len(patternWords), len(queryWords)))
 
 		if count, ok := entry.SuccessfulTools[toolID]; ok && count > 0 {
-			// Bonus scales with similarity AND accumulated evidence for THIS tool.
-			// More successes for this specific tool = higher bonus.
-			// Not divided by TotalQueries — other tools' success doesn't dilute this tool.
-			dataBonusFactor := float64(count) / (float64(count) + 2.0) // 1→0.33, 2→0.50, 5→0.71
-			bonus := similarity * dataBonusFactor * 0.40               // ceiling grows with evidence
+			dataBonusFactor := float64(count) / (float64(count) + 2.0)
+			bonus := similarity * dataBonusFactor * 0.40
 			if bonus > bestBonus {
 				bestBonus = bonus
 			}
@@ -960,6 +973,14 @@ func formatRankedTools(ranked []RankedTool) string {
 		}
 		if r.MemoryBonus > 0 {
 			learned += fmt.Sprintf(" mem=+%.2f", r.MemoryBonus)
+		}
+		if r.ActualCostUSD > 0 {
+			// Show real dollars AND the actual score impact (penalty × weight)
+			costImpact := r.CostPenalty * 0.15 // weight is 15%
+			learned += fmt.Sprintf(" cost=$%.6f impact=-%.3f", r.ActualCostUSD, costImpact)
+		} else if r.CostPenalty > 0.001 {
+			costImpact := r.CostPenalty * 0.15
+			learned += fmt.Sprintf(" cost_impact=-%.3f", costImpact)
 		}
 		parts[i] = fmt.Sprintf("%s(%.2f [r=%.2f s=%.2f c=%.2f p=%s%s])",
 			r.ID, r.Score, r.RelevanceScore, r.SuccessScore, r.ConfidenceScore, r.Predicted, learned)

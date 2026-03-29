@@ -6,8 +6,8 @@ version: "0.1"
 
 # Model configuration (swap providers with a single line change)
 model:
-  provider: ollama  # anthropic | openai | ollama
-  name: llama3
+  provider: openai  # anthropic | openai | ollama
+  name: gpt-4o-mini
   max_tokens: 4096
 
 # Context budget (ARK's killer feature)

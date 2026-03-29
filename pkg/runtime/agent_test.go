@@ -18,7 +18,7 @@ func setupTestAgent() (*Agent, *ctx.Manager) {
 		"get repo: get repository details",
 		`{"name":"github_get_repo"}`)
 	engine := ctx.NewEngine(mgr, ctx.DefaultEngineConfig())
-	return nil, mgr // placeholder — we build agents per test
+	return nil, mgr
 	_ = engine
 	return nil, mgr
 }
@@ -30,12 +30,11 @@ func TestGroundingGateRejectsUngroundedAnswer(t *testing.T) {
 		`{"name":"github_list_repos"}`)
 	engine := ctx.NewEngine(mgr, ctx.DefaultEngineConfig())
 
-	// Mock: LLM tries to answer directly (no tool call), then uses tool on retry
 	executor := &MockExecutor{
 		Responses: []MockResponse{
-			{Text: "Here are some fake repos..."},                                             // step 1: no tool call → grounding gate rejects
-			{ToolName: "github_list_repos", Params: map[string]interface{}{"user": "openai"}}, // step 2: tool call
-			{Text: "Based on the data, OpenAI has these repos..."},                            // step 3: grounded answer
+			{Text: "Here are some fake repos..."},
+			{ToolName: "github_list_repos", Params: map[string]interface{}{"user": "openai"}},
+			{Text: "Based on the data, OpenAI has these repos..."},
 		},
 	}
 	tools := &MockToolHandler{
@@ -51,7 +50,6 @@ func TestGroundingGateRejectsUngroundedAnswer(t *testing.T) {
 		t.Fatal("task should succeed after grounding gate forces tool use")
 	}
 
-	// Check that grounding gate fired
 	groundingFound := false
 	toolCallFound := false
 	for _, step := range result.Steps {
@@ -73,7 +71,6 @@ func TestGroundingGateRejectsUngroundedAnswer(t *testing.T) {
 
 func TestNoToolsNoGroundingGate(t *testing.T) {
 	mgr := ctx.NewManager(ctx.DefaultBudget(200000))
-	// No tools registered — grounding gate should NOT fire
 	engine := ctx.NewEngine(mgr, ctx.DefaultEngineConfig())
 
 	executor := &MockExecutor{
@@ -158,8 +155,8 @@ func TestTraceJSONExport(t *testing.T) {
 		TotalTime:   5 * time.Second,
 		TraceID:     "trace-1",
 		Steps: []StepRecord{
-			{Step: 1, Action: "tool_call", ToolName: "github_list_repos", Output: "data", Tokens: 50, Duration: 2 * time.Second},
-			{Step: 2, Action: "complete", Output: "Hello world", Tokens: 50, Duration: 3 * time.Second},
+			{Step: 1, Action: "tool_call", ToolName: "github_list_repos", Output: "data", InputTokens: 20, OutputTokens: 30, Duration: 2 * time.Second},
+			{Step: 2, Action: "complete", Output: "Hello world", InputTokens: 20, OutputTokens: 30, Duration: 3 * time.Second},
 		},
 	}
 
@@ -236,7 +233,6 @@ func min(a, b int) int {
 }
 
 func TestToolCallWithParamsMissing(t *testing.T) {
-	// Simulate the flow: LLM calls tool without params → param validation rejects → LLM retries
 	mgr := ctx.NewManager(ctx.DefaultBudget(200000))
 	mgr.RegisterTool("github_get_repo", "github_get_repo",
 		"get repo: get repository details",
@@ -262,8 +258,6 @@ func TestToolCallWithParamsMissing(t *testing.T) {
 
 	if !result.Success {
 		t.Logf("Steps: %+v", result.Steps)
-		// This test validates the flow works — mock doesn't have real param validation
-		// because MockToolHandler doesn't check RequiredParams. That's tested in tools/http_test.go
 	}
 
 	hasToolCall := false

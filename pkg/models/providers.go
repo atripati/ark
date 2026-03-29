@@ -222,9 +222,11 @@ func (a *AnthropicProvider) Execute(context string, task string) (*runtime.Model
 	}
 
 	return &runtime.ModelResponse{
-		Text:       text,
-		TokensUsed: apiResp.Usage.InputTokens + apiResp.Usage.OutputTokens,
-		Latency:    time.Since(start),
+		Text:         text,
+		TokensUsed:   apiResp.Usage.InputTokens + apiResp.Usage.OutputTokens,
+		InputTokens:  apiResp.Usage.InputTokens,
+		OutputTokens: apiResp.Usage.OutputTokens,
+		Latency:      time.Since(start),
 	}, nil
 }
 
@@ -254,7 +256,9 @@ type openaiResponse struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
-		TotalTokens int `json:"total_tokens"`
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -313,9 +317,11 @@ func (o *OpenAIProvider) Execute(context string, task string) (*runtime.ModelRes
 	}
 
 	return &runtime.ModelResponse{
-		Text:       text,
-		TokensUsed: apiResp.Usage.TotalTokens,
-		Latency:    time.Since(start),
+		Text:         text,
+		TokensUsed:   apiResp.Usage.TotalTokens,
+		InputTokens:  apiResp.Usage.PromptTokens,
+		OutputTokens: apiResp.Usage.CompletionTokens,
+		Latency:      time.Since(start),
 	}, nil
 }
 
@@ -382,9 +388,11 @@ func (o *OllamaProvider) Execute(context string, task string) (*runtime.ModelRes
 	}
 
 	return &runtime.ModelResponse{
-		Text:       apiResp.Response,
-		TokensUsed: apiResp.PromptEvalCount + apiResp.EvalCount,
-		Latency:    time.Since(start),
+		Text:         apiResp.Response,
+		TokensUsed:   apiResp.PromptEvalCount + apiResp.EvalCount,
+		InputTokens:  apiResp.PromptEvalCount,
+		OutputTokens: apiResp.EvalCount,
+		Latency:      time.Since(start),
 	}, nil
 }
 func truncate(s string, maxLen int) string {

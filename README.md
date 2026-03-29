@@ -1,9 +1,8 @@
 # ARK — AI Runtime Kernel
-runtime that learns from execution
 
-> ARK dynamically controls what goes into an LLM’s context — reducing tool overhead by ~99% and learning from every execution.
+> ARK dynamically controls what goes into an LLM’s context — reducing tool overhead by ~99%, learning from every execution, and attributing cost per decision.
 
-> A Context Operating System for AI agents that gets smarter every time it runs.
+> An economically rational runtime for AI agents. Context optimization. Adaptive execution. Decision-level cost attribution.
 
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go)](https://go.dev)
@@ -86,15 +85,31 @@ ARK manages what your LLM sees. ARK is a runtime that solves three core problems
 
 Every tool is ranked using a weighted score based on runtime signals:
 ```
-  score = (relevance × 0.45)
+  score = (relevance × 0.40)
         + (success_rate × 0.30)
-        - (latency × 0.10)
-        - (token_cost × 0.05)
+        - (latency × 0.05)
+        - (cost × 0.15)          ← real dollar cost, not token estimate
         + (confidence × 0.10)
         + memory_bonus
 ```
 
 Scores and query patterns persist to disk. Run 2 is smarter than Run 1.
+
+**4. Decision-Level Cost Attribution** — every step has a price tag:
+
+```
+  💰 Cost Report: ark-run
+  Model: GPT-4o Mini
+  Total Cost: $0.000493
+    Input:  $0.000209 (1395 tokens)
+    Output: $0.000284 (473 tokens)
+
+  Decision Cost Graph:
+    Step 1 [tool_call: github_list_repos]  $0.000054  (in:303 out:15 tokens)
+    Step 2 [complete]                      $0.000439  (in:1092 out:458 tokens)
+```
+
+Cost flows back into ranking: expensive tools get demoted, cheap reliable tools get promoted. ARK doesn’t just track cost — it acts on cost.
 
 ## Quick Start
 
@@ -167,6 +182,7 @@ Failures handled correctly:
 | No state corruption | Deep-copy persistence, snapshot semantics, race-detector clean |
 | Deterministic ranking | Sorted IDs, stable sort with tiebreaker |
 | Observable | RuntimeMetrics, TraceJSON export, per-tool latency P50 |
+| Cost-aware | Per-decision cost graph, budget enforcement, cost-weighted ranking |
 
 ## Architecture
 
@@ -187,6 +203,9 @@ ark/
 │   ├── runtime/                Agent execution loop
 │   │   ├── agent.go            ReAct loop, grounding gate, metrics, trace export
 │   │   └── agent_test.go       7 tests
+│   ├── cost/                   Decision-level cost attribution
+│   │   ├── cost.go             Tracker, pricing, budget, attribution, aggregation
+│   │   └── cost_test.go        14 tests
 │   ├── store/                  Persistent learning
 │   │   ├── store.go            Channel worker, snapshot semantics, decay
 │   │   └── store_test.go       5 tests
@@ -198,7 +217,7 @@ ark/
 ├── NOTICE                      Attribution
 └── README.md
 
-53 tests | Race detector clean | 30-run stress test passed
+67 tests | Race detector clean | 30-run stress test passed
 ```
 
 ## How the Scoring Works
@@ -207,14 +226,16 @@ Every tool gets a composite score from 6 signals:
 
 | Signal | Weight | What it measures |
 |--------|--------|-----------------|
-| Relevance | 45% | How well the tool matches the current query |
+| Relevance | 40% | How well the tool matches the current query |
 | Success rate | 30% | Historical success/failure ratio |
-| Latency | -10% | Penalty for slow tools |
-| Token cost | -5% | Penalty for expensive schemas |
+| Latency | -5% | Penalty for slow tools |
+| **Cost** | **-15%** | **Real dollar cost per call (not token estimate)** |
 | Confidence | 10% | How much data we have (Bayesian) |
 | Memory bonus | varies | Did this tool work for a similar query before? |
 
-Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved scores. Tools that worked for similar queries get a memory bonus. All of this persists across restarts.
+Cost is a first-class decision signal. A tool that costs 10x more but has the same success rate will be ranked lower. This makes ARK economically rational — it optimizes for value, not just accuracy.
+
+Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved scores. All of this persists across restarts.
 
 ## Roadmap
 
@@ -241,13 +262,24 @@ Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved sc
 - [x] Execution bounds (MaxSteps, TotalTimeout, per-tool retry budget)
 - [x] 53 tests, race detector clean, 30-run stress test
 
-### v0.7 — Real Connectors (next)
+### v0.7 — Cost Attribution ✓ (current)
+- [x] Decision-level cost graph (per-step, per-tool, per-action)
+- [x] Provider-aware pricing (Anthropic, OpenAI, Ollama)
+- [x] Accurate input/output token split (verified with OpenAI)
+- [x] Cost-aware ranking (15% weight, expensive tools demoted)
+- [x] Budget enforcement (max_cost_per_task stops execution)
+- [x] Cost attribution (user_id, feature_id, session_id)
+- [x] Cross-task aggregation (cost by feature, by user, by tool)
+- [x] Human-readable trace (real dollars + score impact)
+- [x] 67 tests, race detector clean
+
+### v0.8 — Real Connectors (next)
 - [ ] MCP server connector (connect to live MCP servers)
 - [ ] Web search tool (Brave/SerpAPI)
 - [ ] File system tools (read/write local files)
 - [ ] Custom HTTP tool registration via agent.yaml
 
-### v0.8 — Production Storage
+### v0.9 — Production Storage
 - [ ] SQLite backend (replace JSON file store)
 - [ ] Multi-agent shared memory
 - [ ] Query pattern clustering (semantic, not keyword)

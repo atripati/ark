@@ -25,15 +25,16 @@ type ModelConfig struct {
 	BaseURL   string `json:"base_url"`
 }
 type ContextConfig struct {
-	TotalTokens           int    `json:"total_tokens"`
-	Strategy              string `json:"strategy"`
-	ToolBudgetPct         int    `json:"tool_budget_pct"`
-	MemoryBudgetPct       int    `json:"memory_budget_pct"`
-	ConversationBudgetPct int    `json:"conversation_budget_pct"`
-	InitialTools          int    `json:"initial_tools"`
-	MaxRetries            int    `json:"max_retries"`
-	MaxSteps              int    `json:"max_steps"`
-	TimeoutSeconds        int    `json:"timeout_seconds"`
+	TotalTokens           int     `json:"total_tokens"`
+	Strategy              string  `json:"strategy"`
+	ToolBudgetPct         int     `json:"tool_budget_pct"`
+	MemoryBudgetPct       int     `json:"memory_budget_pct"`
+	ConversationBudgetPct int     `json:"conversation_budget_pct"`
+	InitialTools          int     `json:"initial_tools"`
+	MaxRetries            int     `json:"max_retries"`
+	MaxSteps              int     `json:"max_steps"`
+	TimeoutSeconds        int     `json:"timeout_seconds"`
+	MaxCostPerTask        float64 `json:"max_cost_per_task"` // USD budget cap per task (0 = unlimited)
 }
 type ToolConfig struct {
 	Name        string `json:"name"`

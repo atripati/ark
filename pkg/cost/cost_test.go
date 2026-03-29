@@ -80,17 +80,15 @@ func TestTrackerRunningCost(t *testing.T) {
 }
 
 func TestBudgetEnforcement(t *testing.T) {
-	pricing := CustomPricing("test", "test", 100.0, 100.0) // $0.0001 per token
+	pricing := CustomPricing("test", "test", 100.0, 100.0)
 	tracker := NewTracker(pricing)
-	tracker.SetBudget(0.001) // $0.001 budget
+	tracker.SetBudget(0.001)
 
-	// This should be within budget
 	tracker.RecordStep(1, 5, 3, "tool_call", "tool_a", time.Second)
 	if tracker.BudgetExceeded() {
 		t.Error("budget should not be exceeded after small step")
 	}
 
-	// This should exceed budget
 	tracker.RecordStep(2, 5000, 3000, "complete", "", time.Second)
 	if !tracker.BudgetExceeded() {
 		t.Error("budget should be exceeded after large step")
@@ -104,7 +102,6 @@ func TestBudgetEnforcement(t *testing.T) {
 
 func TestBudgetUnlimited(t *testing.T) {
 	tracker := NewTracker(ModelPricing("openai", "gpt-4o"))
-	// No budget set
 	tracker.RecordStep(1, 10000, 10000, "complete", "", time.Second)
 
 	if tracker.BudgetExceeded() {
@@ -208,7 +205,6 @@ func TestReportSummary(t *testing.T) {
 	if summary == "" {
 		t.Fatal("summary should not be empty")
 	}
-	// Should contain key elements
 	for _, want := range []string{"Cost Report", "Decision Cost Graph", "Total Cost", "Step 1", "Step 2"} {
 		if !contains(summary, want) {
 			t.Errorf("summary missing %q", want)
@@ -220,21 +216,18 @@ func TestReportSummary(t *testing.T) {
 func TestAggregation(t *testing.T) {
 	agg := NewAggregate()
 
-	// Task 1: user A, feature X
 	t1 := NewTracker(ModelPricing("openai", "gpt-4o"))
 	t1.SetTaskID("task-1")
 	t1.SetAttribution("user-a", "feature-x", "")
 	t1.RecordStep(1, 100, 200, "tool_call", "github_list_repos", time.Second)
 	agg.Add(t1.Report())
 
-	// Task 2: user B, feature X
 	t2 := NewTracker(ModelPricing("openai", "gpt-4o"))
 	t2.SetTaskID("task-2")
 	t2.SetAttribution("user-b", "feature-x", "")
 	t2.RecordStep(1, 200, 400, "tool_call", "github_get_repo", time.Second)
 	agg.Add(t2.Report())
 
-	// Task 3: user A, feature Y
 	t3 := NewTracker(ModelPricing("openai", "gpt-4o"))
 	t3.SetTaskID("task-3")
 	t3.SetAttribution("user-a", "feature-y", "")
@@ -279,14 +272,12 @@ func TestAggregation(t *testing.T) {
 func TestToolCostEfficiency(t *testing.T) {
 	agg := NewAggregate()
 
-	// Tool A: 2 successes, cheap
 	for i := 0; i < 2; i++ {
 		tr := NewTracker(ModelPricing("openai", "gpt-4o"))
 		tr.RecordStep(1, 100, 50, "tool_call", "cheap_tool", time.Second)
 		agg.Add(tr.Report())
 	}
 
-	// Tool B: 1 success + 2 failures, expensive
 	for i := 0; i < 2; i++ {
 		tr := NewTracker(ModelPricing("openai", "gpt-4o"))
 		tr.RecordStep(1, 500, 300, "tool_call_retry", "expensive_tool", time.Second)
@@ -327,4 +318,59 @@ func abs(f float64) float64 {
 		return -f
 	}
 	return f
+}
+
+func TestBudgetStopsExecution(t *testing.T) {
+	pricing := CustomPricing("test", "test", 1000.0, 1000.0)
+	tracker := NewTracker(pricing)
+	tracker.SetBudget(0.003)
+
+	tracker.RecordStep(1, 1000, 500, "tool_call", "tool_a", time.Second)
+	if tracker.BudgetExceeded() {
+		t.Log("Budget exceeded after step 1 — budget is very tight")
+	}
+
+	tracker.RecordStep(2, 2000, 1000, "complete", "", time.Second)
+	if !tracker.BudgetExceeded() {
+		t.Error("budget should be exceeded after step 2")
+	}
+
+	report := tracker.Report()
+	if !report.BudgetExceeded {
+		t.Error("report should show budget exceeded")
+	}
+	if report.BudgetUsedPct < 100 {
+		t.Errorf("budget used should be >= 100%%, got %.1f%%", report.BudgetUsedPct)
+	}
+
+	t.Logf("Budget test: limit=$%.4f, used=$%.4f (%.0f%%), exceeded=%v",
+		report.BudgetLimit, report.TotalCost, report.BudgetUsedPct, report.BudgetExceeded)
+}
+
+func TestCostAwarePricingComparison(t *testing.T) {
+	models := []struct {
+		provider, model string
+		wantCheaper     bool
+	}{
+		{"openai", "gpt-4o-mini", true},
+		{"openai", "gpt-4o", false},
+		{"ollama", "llama3", true},
+	}
+
+	costs := make(map[string]float64)
+	for _, m := range models {
+		tracker := NewTracker(ModelPricing(m.provider, m.model))
+		tracker.RecordStep(1, 500, 200, "tool_call", "test_tool", time.Second)
+		report := tracker.Report()
+		costs[m.provider+"/"+m.model] = report.TotalCost
+		t.Logf("%s/%s: $%.6f", m.provider, m.model, report.TotalCost)
+	}
+
+	if costs["openai/gpt-4o"] <= costs["openai/gpt-4o-mini"] {
+		t.Error("gpt-4o should cost more than gpt-4o-mini")
+	}
+
+	if costs["ollama/llama3"] != 0 {
+		t.Errorf("ollama should be free, got $%.6f", costs["ollama/llama3"])
+	}
 }

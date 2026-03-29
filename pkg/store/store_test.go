@@ -23,7 +23,6 @@ func TestStoreWriteAndRead(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	// Wait for async worker to process, then flush
 	time.Sleep(50 * time.Millisecond)
 	s.Flush()
 
@@ -50,14 +49,13 @@ func TestStorePatternSnapshot(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Save pattern twice — second should REPLACE, not accumulate
 	s.SavePattern(QueryPatternRecord{
 		Pattern:         "list repos",
 		SuccessfulTools: map[string]int{"github_list_repos": 1},
 		TotalQueries:    1,
 		LastUsed:        time.Now(),
 	})
-	time.Sleep(50 * time.Millisecond) // let worker process
+	time.Sleep(50 * time.Millisecond)
 
 	s.SavePattern(QueryPatternRecord{
 		Pattern:         "list repos",
@@ -76,7 +74,6 @@ func TestStorePatternSnapshot(t *testing.T) {
 		t.Fatalf("expected 1 pattern, got %d", len(patterns))
 	}
 
-	// Should be 2 (snapshot), NOT 3 (cumulative 1+2)
 	count := patterns[0].SuccessfulTools["github_list_repos"]
 	if count != 2 {
 		t.Errorf("expected snapshot count=2, got %d (cumulative merge bug if >2)", count)
@@ -91,7 +88,6 @@ func TestStoreDecay(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Save a stale record (60 days old)
 	s.Save(ToolStatsRecord{
 		ToolID: "old_tool", TotalCalls: 10, Successes: 10,
 		LastUsed: time.Now().Add(-60 * 24 * time.Hour),
@@ -120,7 +116,6 @@ func TestStoreDecay(t *testing.T) {
 func TestStorePersistsToDisk(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test-persist.json")
 
-	// Create, write, close
 	s1, err := NewJSONFileStore(path)
 	if err != nil {
 		t.Fatalf("create store: %v", err)
@@ -132,12 +127,10 @@ func TestStorePersistsToDisk(t *testing.T) {
 	s1.Flush()
 	s1.Close()
 
-	// Verify file exists
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Fatal("store file should exist on disk")
 	}
 
-	// Re-open and verify data survived
 	s2, err := NewJSONFileStore(path)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -161,7 +154,6 @@ func TestStoreConcurrentWrites(t *testing.T) {
 	}
 	defer s.Close()
 
-	// Fire 50 concurrent writes
 	done := make(chan bool, 50)
 	for i := 0; i < 50; i++ {
 		go func(n int) {
@@ -177,7 +169,6 @@ func TestStoreConcurrentWrites(t *testing.T) {
 	}
 	s.Flush()
 
-	// Should not panic, and should have exactly 1 record (last write wins)
 	records, _ := s.LoadAll()
 	if len(records) != 1 {
 		t.Errorf("expected 1 record (last write wins), got %d", len(records))

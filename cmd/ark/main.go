@@ -604,6 +604,9 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	if cfg.Context.TimeoutSeconds > 0 {
 		agentConfig.TotalTimeout = time.Duration(cfg.Context.TimeoutSeconds) * time.Second
 	}
+	if cfg.Context.MaxCostPerTask > 0 {
+		agentConfig.MaxCostPerTask = cfg.Context.MaxCostPerTask
+	}
 	agent := runtime.NewAgent(engine, provider, toolRouter, agentConfig)
 
 	if task == "" {
@@ -640,6 +643,12 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	if result.Output != "" {
 		fmt.Printf("\n  Output:\n  %s\n", result.Output)
 	}
+
+	// Print decision cost graph
+	if result.CostReport != nil {
+		fmt.Print(result.CostReport.Summary())
+	}
+
 	fmt.Println()
 
 	if memStore != nil {
