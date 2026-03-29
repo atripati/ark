@@ -261,13 +261,19 @@ func (m *Manager) Render() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	// Sort active IDs for deterministic rendering (map order is random)
+	activeIDs := make([]string, 0, len(m.active))
+	for id := range m.active {
+		activeIDs = append(activeIDs, id)
+	}
+	sort.Strings(activeIDs)
+
 	var system, tools, memory, working, conversation []string
 
-	for id := range m.active {
+	for _, id := range activeIDs {
 		block := m.registry[id]
 		content := block.Content
 		if block.CompressedTokens > 0 && m.usage[block.Type] <= m.budgetFor(block.Type) {
-			// Check if we loaded compressed
 			content = m.effectiveContent(block)
 		}
 

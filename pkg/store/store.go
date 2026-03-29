@@ -161,23 +161,16 @@ func (s *JSONFileStore) applyWrite(op writeOp) {
 	}
 
 	if op.pattern != nil {
-		existing, ok := s.data.QueryPatterns[op.pattern.Pattern]
-		if ok {
-			for tool, count := range op.pattern.SuccessfulTools {
-				existing.SuccessfulTools[tool] += count
-			}
-			existing.TotalQueries = op.pattern.TotalQueries
-			existing.LastUsed = op.pattern.LastUsed
-			s.data.QueryPatterns[op.pattern.Pattern] = existing
-		} else {
-			toolsCopy := make(map[string]int, len(op.pattern.SuccessfulTools))
-			for k, v := range op.pattern.SuccessfulTools {
-				toolsCopy[k] = v
-			}
-			record := *op.pattern
-			record.SuccessfulTools = toolsCopy
-			s.data.QueryPatterns[record.Pattern] = record
+		// SNAPSHOT semantics: replace entire record.
+		// The engine owns the authoritative counts; the store is a mirror.
+		// Cumulative merging caused count inflation over time.
+		record := *op.pattern
+		toolsCopy := make(map[string]int, len(record.SuccessfulTools))
+		for k, v := range record.SuccessfulTools {
+			toolsCopy[k] = v
 		}
+		record.SuccessfulTools = toolsCopy
+		s.data.QueryPatterns[record.Pattern] = record
 		s.dirty++
 	}
 

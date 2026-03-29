@@ -19,6 +19,8 @@ context:
   tool_budget: 10%    # vs 30-50% with raw MCP
   memory_budget: 10%
   conversation_budget: 35%
+  max_steps: 5         # hard cap on agent steps per task
+  timeout_seconds: 120 # wall-clock timeout (increase for slow models)
 
 # Tools available to this agent
 tools:

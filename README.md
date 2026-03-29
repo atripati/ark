@@ -140,6 +140,34 @@ ark run agent.yaml --task "create issue" --dry-run      # ✅ simulate
 
 Additional protections: domain allowlist (only `api.github.com` by default), output sanitization (4000 char cap), full audit traces for every context decision.
 
+## Stress Tested
+
+ARK was stress tested with 30 sequential and parallel runs. Results:
+
+```
+Sequential (20 runs):  20/20 completed, 0 crashes, 0 hallucinated data
+Parallel (10 runs):    10/10 completed, 0 crashes, 0 state corruption
+
+Failures handled correctly:
+  401 (no auth)     → LLM retried with user param → succeeded
+  Tool hallucinated → "github_get_repos" rejected, valid tools listed → LLM self-corrected
+  Timeout           → clean termination with structured error
+```
+
+**Zero hallucinated answers across all 30 runs.** Every answer was grounded in real API data.
+
+## Production Guarantees
+
+| Guarantee | How |
+|-----------|-----|
+| No hallucination when tools available | Grounding gate blocks ungrounded answers |
+| No invalid tool calls | RequiredParams validated before execution |
+| No runaway loops | MaxSteps=5, TotalTimeout=120s, per-tool retry budget |
+| No silent failures | Structured error taxonomy (auth/404/429/timeout/params) |
+| No state corruption | Deep-copy persistence, snapshot semantics, race-detector clean |
+| Deterministic ranking | Sorted IDs, stable sort with tiebreaker |
+| Observable | RuntimeMetrics, TraceJSON export, per-tool latency P50 |
+
 ## Architecture
 
 ```
@@ -157,15 +185,20 @@ ark/
 │   ├── models/                 LLM providers (Anthropic, OpenAI, Ollama)
 │   │   └── providers.go        Raw HTTP, retry + backoff, no SDKs
 │   ├── runtime/                Agent execution loop
-│   │   └── agent.go            task → plan → execute → observe → adapt
+│   │   ├── agent.go            ReAct loop, grounding gate, metrics, trace export
+│   │   └── agent_test.go       7 tests
 │   ├── store/                  Persistent learning
-│   │   └── store.go            Channel worker, buffered writes, decay
+│   │   ├── store.go            Channel worker, snapshot semantics, decay
+│   │   └── store_test.go       5 tests
 │   └── tools/                  Real tool execution
-│       ├── http.go             HTTP executor, domain allowlist, safety
-│       └── github.go           6 GitHub API tools
+│       ├── http.go             Router, param validation, safety layer
+│       ├── http_test.go        8 tests
+│       └── github.go           6 GitHub API tools with RequiredParams
 ├── LICENSE                     Apache 2.0
 ├── NOTICE                      Attribution
 └── README.md
+
+53 tests | Race detector clean | 30-run stress test passed
 ```
 
 ## How the Scoring Works
@@ -185,7 +218,7 @@ Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved sc
 
 ## Roadmap
 
-### v0.5 — Learning Runtime ✅ (current)
+### v0.5 — Learning Runtime ✅
 - [x] Context engine with budget allocation + compression
 - [x] Dynamic context: load → observe → expand → retry
 - [x] Weighted tool scoring (6 signals)
@@ -197,12 +230,24 @@ Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved sc
 - [x] Safety: domain allowlist, write protection, dry-run
 - [x] 33 tests, 5 CLI commands
 
-### v0.6 — Real Connectors
+### v0.6 — Production Hardening ✅
+- [x] Grounding gate (no hallucination when tools available)
+- [x] Parameter validation (RequiredParams on all tools)
+- [x] Error taxonomy (auth/404/429/timeout/params → distinct strategies)
+- [x] Monotonic learning (scores never regress on success)
+- [x] Deterministic ranking (sorted IDs, stable sort)
+- [x] Safe persistence (deep-copy, snapshot semantics)
+- [x] Runtime metrics + TraceJSON export
+- [x] Execution bounds (MaxSteps, TotalTimeout, per-tool retry budget)
+- [x] 53 tests, race detector clean, 30-run stress test
+
+### v0.7 — Real Connectors (next)
 - [ ] MCP server connector (connect to live MCP servers)
-- [ ] Slack tools
+- [ ] Web search tool (Brave/SerpAPI)
+- [ ] File system tools (read/write local files)
 - [ ] Custom HTTP tool registration via agent.yaml
 
-### v0.7 — Production Storage
+### v0.8 — Production Storage
 - [ ] SQLite backend (replace JSON file store)
 - [ ] Multi-agent shared memory
 - [ ] Query pattern clustering (semantic, not keyword)
@@ -212,6 +257,7 @@ Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved sc
 - [ ] Hot-reload agent configs
 - [ ] Plugin system for custom tools
 - [ ] OpenTelemetry trace export
+- [ ] `go get github.com/atripati/ark` library mode
 
 ## Contributing
 

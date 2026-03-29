@@ -19,46 +19,52 @@ func RegisterGitHub(router *Router, token string) {
 	}
 
 	router.RegisterTool(Tool{
-		Name:        "github_list_repos",
-		Description: "List GitHub repositories for a user (returns top 5 by recent activity)",
-		Version:     "v1",
-		Handler:     gh.listRepos,
-		Metadata:    map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
+		Name:           "github_list_repos",
+		Description:    "list repos: list GitHub repositories for a user or organization",
+		Version:        "v1",
+		Handler:        gh.listRepos,
+		RequiredParams: []string{},
+		Metadata:       map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
 	})
 	router.RegisterTool(Tool{
-		Name:        "github_get_repo",
-		Description: "Get details of a specific GitHub repository",
-		Version:     "v1",
-		Handler:     gh.getRepo,
-		Metadata:    map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
+		Name:           "github_get_repo",
+		Description:    "get repo: get details of a specific GitHub repository",
+		Version:        "v1",
+		Handler:        gh.getRepo,
+		RequiredParams: []string{"owner", "repo"},
+		Metadata:       map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
 	})
 	router.RegisterTool(Tool{
-		Name:        "github_list_issues",
-		Description: "List issues in a GitHub repository (returns top 5)",
-		Version:     "v1",
-		Handler:     gh.listIssues,
-		Metadata:    map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
+		Name:           "github_list_issues",
+		Description:    "list issues: list issues in a GitHub repository",
+		Version:        "v1",
+		Handler:        gh.listIssues,
+		RequiredParams: []string{"owner", "repo"},
+		Metadata:       map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
 	})
 	router.RegisterTool(Tool{
-		Name:        "github_create_issue",
-		Description: "Create a new issue in a GitHub repository",
-		Version:     "v1",
-		Handler:     gh.createIssue,
-		Metadata:    map[string]interface{}{"type": "write", "auth_required": true, "method": "POST", "domain": "api.github.com"},
+		Name:           "github_create_issue",
+		Description:    "create issue: create a new issue in a GitHub repository",
+		Version:        "v1",
+		Handler:        gh.createIssue,
+		RequiredParams: []string{"owner", "repo", "title"},
+		Metadata:       map[string]interface{}{"type": "write", "auth_required": true, "method": "POST", "domain": "api.github.com"},
 	})
 	router.RegisterTool(Tool{
-		Name:        "github_list_pulls",
-		Description: "List pull requests in a GitHub repository (returns top 5)",
-		Version:     "v1",
-		Handler:     gh.listPulls,
-		Metadata:    map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
+		Name:           "github_list_pulls",
+		Description:    "list pulls: list pull requests in a GitHub repository",
+		Version:        "v1",
+		Handler:        gh.listPulls,
+		RequiredParams: []string{"owner", "repo"},
+		Metadata:       map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
 	})
 	router.RegisterTool(Tool{
-		Name:        "github_get_user",
-		Description: "Get authenticated GitHub user info",
-		Version:     "v1",
-		Handler:     gh.getUser,
-		Metadata:    map[string]interface{}{"type": "read", "auth_required": true, "method": "GET", "domain": "api.github.com"},
+		Name:           "github_get_user",
+		Description:    "get user: get GitHub user information",
+		Version:        "v1",
+		Handler:        gh.getUser,
+		RequiredParams: []string{},
+		Metadata:       map[string]interface{}{"type": "read", "auth_required": true, "method": "GET", "domain": "api.github.com"},
 	})
 }
 func RegisterGitHubFromEnv(router *Router) {
@@ -83,6 +89,12 @@ func (g *githubTools) headers() map[string]string {
 
 func (g *githubTools) listRepos(params map[string]interface{}) (string, error) {
 	user, _ := params["user"].(string)
+
+	// If no user specified and no token, we can't hit /user/repos (requires auth).
+	// Return a clear error so the LLM knows to provide a username.
+	if user == "" && g.token == "" {
+		return "", fmt.Errorf("github_list_repos: 'user' param required when no GITHUB_TOKEN is set (e.g. {\"user\": \"openai\"})")
+	}
 
 	url := githubAPI + "/user/repos?per_page=10&sort=updated"
 	if user != "" {

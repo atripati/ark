@@ -32,6 +32,8 @@ type ContextConfig struct {
 	ConversationBudgetPct int    `json:"conversation_budget_pct"`
 	InitialTools          int    `json:"initial_tools"`
 	MaxRetries            int    `json:"max_retries"`
+	MaxSteps              int    `json:"max_steps"`
+	TimeoutSeconds        int    `json:"timeout_seconds"`
 }
 type ToolConfig struct {
 	Name        string `json:"name"`

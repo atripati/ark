@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,11 +21,12 @@ type Executor interface {
 }
 
 type Tool struct {
-	Name        string
-	Description string
-	Version     string
-	Handler     ToolFunc
-	Metadata    map[string]interface{}
+	Name           string
+	Description    string
+	Version        string
+	Handler        ToolFunc
+	Metadata       map[string]interface{}
+	RequiredParams []string // validated before execution — runtime enforces correctness
 }
 type ToolFunc func(params map[string]interface{}) (string, error)
 
@@ -80,7 +82,8 @@ func (r *Router) Handle(call *runtime.ToolCall) error {
 	}
 
 	if !ok {
-		call.Error = fmt.Errorf("ark/tools: no handler for %q", call.Name)
+		validTools := r.toolNames()
+		call.Error = fmt.Errorf("ark/tools: no handler for %q (valid tools: %s)", call.Name, strings.Join(validTools, ", "))
 		return call.Error
 	}
 	toolType, _ := t.Metadata["type"].(string)
@@ -93,9 +96,28 @@ func (r *Router) Handle(call *runtime.ToolCall) error {
 		return nil
 	}
 	if toolType == "write" && !r.AllowWrite {
-		call.Error = fmt.Errorf("ark: write operation %q blocked (use --allow-write to enable)", call.Name)
+		call.Error = fmt.Errorf("ark/tools: write operation %q blocked (use --allow-write to enable)", call.Name)
 		return call.Error
 	}
+
+	// Parameter validation — runtime enforces correctness, not the LLM
+	if len(t.RequiredParams) > 0 {
+		var missing []string
+		for _, key := range t.RequiredParams {
+			val, exists := call.Params[key]
+			if !exists {
+				missing = append(missing, key)
+			} else if s, ok := val.(string); ok && s == "" {
+				missing = append(missing, key)
+			}
+		}
+		if len(missing) > 0 {
+			call.Error = fmt.Errorf("ark/tools/%s: missing required params: %s (required: %v)",
+				call.Name, strings.Join(missing, ", "), t.RequiredParams)
+			return call.Error
+		}
+	}
+
 	result, err := t.Handler(call.Params)
 	if err != nil {
 		call.Error = err
@@ -111,14 +133,18 @@ func (r *Router) RegisterHTTP(name string, config HTTPToolConfig) {
 		return exec.Execute(config, params)
 	})
 }
-func (r *Router) ToolCount() int {
-	return len(r.tools)
-}
-func (r *Router) GetTool(name string) *Tool {
-	return r.tools[name]
-}
-func (r *Router) GetExecutor() Executor {
-	return r.executor
+func (r *Router) ToolCount() int            { return len(r.tools) }
+func (r *Router) GetTool(name string) *Tool { return r.tools[name] }
+func (r *Router) GetExecutor() Executor     { return r.executor }
+
+// toolNames returns sorted list of registered tool names (for error messages).
+func (r *Router) toolNames() []string {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 const (

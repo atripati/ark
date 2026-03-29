@@ -144,6 +144,8 @@ context:
   tool_budget: 10%    # vs 30-50% with raw MCP
   memory_budget: 10%
   conversation_budget: 35%
+  max_steps: 5         # hard cap on agent steps per task
+  timeout_seconds: 120 # wall-clock timeout (increase for slow models)
 
 # Tools available to this agent
 tools:
@@ -594,6 +596,14 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 
 	agentConfig := runtime.DefaultAgentConfig()
 	agentConfig.Verbose = cfg.Tracing.Enabled
+	agentConfig.Provider = cfg.Model.Provider
+	agentConfig.Model = cfg.Model.Name
+	if cfg.Context.MaxSteps > 0 {
+		agentConfig.MaxSteps = cfg.Context.MaxSteps
+	}
+	if cfg.Context.TimeoutSeconds > 0 {
+		agentConfig.TotalTimeout = time.Duration(cfg.Context.TimeoutSeconds) * time.Second
+	}
 	agent := runtime.NewAgent(engine, provider, toolRouter, agentConfig)
 
 	if task == "" {

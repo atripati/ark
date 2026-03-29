@@ -4,15 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	ctx "github.com/atripati/ark/pkg/context"
+	"github.com/atripati/ark/pkg/cost"
 )
 
+// ──────────────────────────────────────────────────────────
+// Interfaces
+// ──────────────────────────────────────────────────────────
+
+// Executor sends prompts to an LLM and returns responses.
 type Executor interface {
 	Execute(context string, task string) (*ModelResponse, error)
 }
 
+// ModelResponse is what comes back from the LLM.
 type ModelResponse struct {
 	Text       string
 	ToolCall   *ToolCall
@@ -20,6 +28,7 @@ type ModelResponse struct {
 	Latency    time.Duration
 }
 
+// ToolCall represents a tool invocation requested by the model.
 type ToolCall struct {
 	Name   string
 	Params map[string]interface{}
@@ -27,38 +36,63 @@ type ToolCall struct {
 	Error  error
 }
 
+// ToolHandler executes actual tool calls.
 type ToolHandler interface {
 	Handle(call *ToolCall) error
 }
 
+// ──────────────────────────────────────────────────────────
+// Agent — ReAct loop (Reason → Act → Observe → Repeat)
+// ──────────────────────────────────────────────────────────
+
+// Agent runs tasks using an LLM with tool access managed by ARK's context engine.
 type Agent struct {
 	engine   *ctx.Engine
 	executor Executor
 	tools    ToolHandler
 	config   AgentConfig
+	Metrics  *RuntimeMetrics
 }
 
+// AgentConfig controls agent behavior and execution bounds.
 type AgentConfig struct {
-	MaxSteps int
-	Verbose  bool
+	MaxSteps          int           // hard cap on total steps (default: 5)
+	MaxRetriesPerTool int           // max retries for same tool before switching (default: 2)
+	TotalTimeout      time.Duration // hard wall-clock timeout for entire task (default: 60s)
+	Verbose           bool
+
+	// Cost control
+	Provider       string  // LLM provider name (anthropic, openai, ollama)
+	Model          string  // LLM model name
+	MaxCostPerTask float64 // budget cap in USD (0 = unlimited)
 }
 
+// DefaultAgentConfig returns production-safe defaults.
 func DefaultAgentConfig() AgentConfig {
 	return AgentConfig{
-		MaxSteps: 10,
-		Verbose:  true,
+		MaxSteps:          5,
+		MaxRetriesPerTool: 2,
+		TotalTimeout:      60 * time.Second,
+		Verbose:           true,
 	}
 }
 
+// NewAgent creates an agent with the given engine, LLM, and tools.
 func NewAgent(engine *ctx.Engine, executor Executor, tools ToolHandler, config AgentConfig) *Agent {
 	return &Agent{
 		engine:   engine,
 		executor: executor,
 		tools:    tools,
 		config:   config,
+		Metrics:  NewRuntimeMetrics(),
 	}
 }
 
+// ──────────────────────────────────────────────────────────
+// Task Result
+// ──────────────────────────────────────────────────────────
+
+// TaskResult captures everything about a completed task.
 type TaskResult struct {
 	TaskID      string
 	Success     bool
@@ -67,11 +101,13 @@ type TaskResult struct {
 	TotalTokens int
 	TotalTime   time.Duration
 	TraceID     string
+	CostReport  *cost.CostReport // per-decision cost attribution
 }
 
+// StepRecord captures a single step in the agent loop.
 type StepRecord struct {
 	Step     int
-	Action   string
+	Action   string // "tool_call", "tool_call_retry", "grounding_rejected", "complete", "error"
 	ToolName string
 	Input    string
 	Output   string
@@ -80,11 +116,161 @@ type StepRecord struct {
 	Strategy string
 }
 
+// ──────────────────────────────────────────────────────────
+// Runtime Metrics — production observability
+// ──────────────────────────────────────────────────────────
+
+// RuntimeMetrics tracks counters and latencies across all tasks.
+// Thread-safe — can be read while agent is running.
+type RuntimeMetrics struct {
+	mu               sync.Mutex
+	TasksTotal       int                        `json:"tasks_total"`
+	TasksSucceeded   int                        `json:"tasks_succeeded"`
+	TasksFailed      int                        `json:"tasks_failed"`
+	ToolCallsTotal   int                        `json:"tool_calls_total"`
+	ToolCallsSuccess int                        `json:"tool_calls_success"`
+	ToolCallsFailed  int                        `json:"tool_calls_failed"`
+	GroundingRejects int                        `json:"grounding_rejects"`
+	ParamRejects     int                        `json:"param_rejects"`
+	TotalTokens      int                        `json:"total_tokens"`
+	TotalLatency     time.Duration              `json:"total_latency_ms"`
+	AvgLatency       time.Duration              `json:"avg_latency_ms"`
+	ToolLatencies    map[string][]time.Duration `json:"-"` // per-tool latency samples
+}
+
+// NewRuntimeMetrics creates a metrics collector.
+func NewRuntimeMetrics() *RuntimeMetrics {
+	return &RuntimeMetrics{ToolLatencies: make(map[string][]time.Duration)}
+}
+
+func (m *RuntimeMetrics) recordTask(result *TaskResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.TasksTotal++
+	if result.Success {
+		m.TasksSucceeded++
+	} else {
+		m.TasksFailed++
+	}
+	m.TotalTokens += result.TotalTokens
+	m.TotalLatency += result.TotalTime
+	if m.TasksTotal > 0 {
+		m.AvgLatency = m.TotalLatency / time.Duration(m.TasksTotal)
+	}
+	for _, step := range result.Steps {
+		switch step.Action {
+		case "tool_call":
+			m.ToolCallsTotal++
+			m.ToolCallsSuccess++
+			if step.ToolName != "" {
+				m.ToolLatencies[step.ToolName] = append(m.ToolLatencies[step.ToolName], step.Duration)
+			}
+		case "tool_call_retry":
+			m.ToolCallsTotal++
+			m.ToolCallsFailed++
+		case "grounding_rejected":
+			m.GroundingRejects++
+		}
+	}
+}
+
+// Snapshot returns a JSON-safe copy of current metrics.
+func (m *RuntimeMetrics) Snapshot() RuntimeMetrics {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return RuntimeMetrics{
+		TasksTotal: m.TasksTotal, TasksSucceeded: m.TasksSucceeded,
+		TasksFailed: m.TasksFailed, ToolCallsTotal: m.ToolCallsTotal,
+		ToolCallsSuccess: m.ToolCallsSuccess, ToolCallsFailed: m.ToolCallsFailed,
+		GroundingRejects: m.GroundingRejects, ParamRejects: m.ParamRejects,
+		TotalTokens: m.TotalTokens, TotalLatency: m.TotalLatency, AvgLatency: m.AvgLatency,
+	}
+}
+
+// ToolP50 returns the median latency for a tool.
+func (m *RuntimeMetrics) ToolP50(toolName string) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	samples := m.ToolLatencies[toolName]
+	if len(samples) == 0 {
+		return 0
+	}
+	sorted := make([]time.Duration, len(samples))
+	copy(sorted, samples)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	return sorted[len(sorted)/2]
+}
+
+// TraceJSON exports a task result as JSON for production debugging.
+func TraceJSON(result *TaskResult) (string, error) {
+	type jsonStep struct {
+		Step     int    `json:"step"`
+		Action   string `json:"action"`
+		Tool     string `json:"tool,omitempty"`
+		Output   string `json:"output"`
+		Tokens   int    `json:"tokens"`
+		Duration string `json:"duration"`
+	}
+	type jsonTrace struct {
+		TaskID   string     `json:"task_id"`
+		Success  bool       `json:"success"`
+		Output   string     `json:"output"`
+		Steps    []jsonStep `json:"steps"`
+		Tokens   int        `json:"total_tokens"`
+		Duration string     `json:"total_duration"`
+		TraceID  string     `json:"trace_id"`
+	}
+	trace := jsonTrace{
+		TaskID: result.TaskID, Success: result.Success, Output: result.Output,
+		Tokens: result.TotalTokens, Duration: result.TotalTime.Round(time.Millisecond).String(),
+		TraceID: result.TraceID,
+	}
+	for _, s := range result.Steps {
+		trace.Steps = append(trace.Steps, jsonStep{
+			Step: s.Step, Action: s.Action, Tool: s.ToolName,
+			Output: truncateStr(s.Output, 200), Tokens: s.Tokens,
+			Duration: s.Duration.Round(time.Millisecond).String(),
+		})
+	}
+	data, err := json.MarshalIndent(trace, "", "  ")
+	return string(data), err
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// ──────────────────────────────────────────────────────────
+// Run — the ReAct loop
+// ──────────────────────────────────────────────────────────
+
+// Run executes a task using the ReAct pattern:
+//
+//	Step 1: LLM receives task + available tools → decides to call a tool or answer directly
+//	Step 2: If tool call → execute tool → feed result back to LLM
+//	Step 3: LLM sees tool result → answers the user's question with real data
+//
+// This prevents hallucination: the LLM must use tools for factual queries.
 func (a *Agent) Run(taskID, task string) *TaskResult {
 	startTime := time.Now()
 	result := &TaskResult{
 		TaskID: taskID,
 		Steps:  make([]StepRecord, 0),
+	}
+
+	// Initialize cost tracker
+	pricing := cost.ModelPricing(a.config.Provider, a.config.Model)
+	costTracker := cost.NewTracker(pricing)
+	costTracker.SetTaskID(taskID)
+	if a.config.MaxCostPerTask > 0 {
+		costTracker.SetBudget(a.config.MaxCostPerTask)
 	}
 
 	if a.config.Verbose {
@@ -93,6 +279,7 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 		fmt.Printf("│\n")
 	}
 
+	// Prepare context — loads relevant tools based on the query
 	plan := a.engine.PrepareContext(taskID, task)
 	result.TraceID = plan.TraceID
 
@@ -101,17 +288,52 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			len(plan.ToolsLoaded), plan.TokensUsed, plan.Strategy)
 	}
 
+	// Build system prompt with tool instructions
 	toolContext := a.engine.Manager().Render()
 	systemPrompt := buildSystemPrompt(toolContext, plan.ToolsLoaded)
 
+	// Conversation history for multi-turn (tool result → LLM interpretation)
 	var history []message
 	history = append(history, message{Role: "user", Content: task})
 
+	// Execution state — grounding gate tracks if real data was fetched
+	toolsWereLoaded := len(plan.ToolsLoaded) > 0
+	toolCallSucceeded := false
+	toolRetries := make(map[string]int) // per-tool retry budget
+	deadline := time.Now().Add(a.config.TotalTimeout)
+
 	for step := 0; step < a.config.MaxSteps; step++ {
+		// Execution bound: wall-clock timeout
+		if time.Now().After(deadline) {
+			if a.config.Verbose {
+				fmt.Printf("├─ Step %d: TIMEOUT — total execution exceeded %v\n", step+1, a.config.TotalTimeout)
+			}
+			result.Steps = append(result.Steps, StepRecord{
+				Step: step + 1, Action: "timeout",
+				Output: fmt.Sprintf("execution_limit_exceeded: total timeout %v", a.config.TotalTimeout),
+			})
+			break
+		}
+
+		// Execution bound: cost budget
+		if costTracker.BudgetExceeded() {
+			if a.config.Verbose {
+				fmt.Printf("├─ Step %d: BUDGET EXCEEDED — cost $%.6f exceeds limit $%.4f\n",
+					step+1, costTracker.RunningCost(), a.config.MaxCostPerTask)
+			}
+			result.Steps = append(result.Steps, StepRecord{
+				Step: step + 1, Action: "budget_exceeded",
+				Output: fmt.Sprintf("cost_limit_exceeded: $%.6f >= $%.4f", costTracker.RunningCost(), a.config.MaxCostPerTask),
+			})
+			break
+		}
+
 		stepStart := time.Now()
 
+		// Build the full prompt from history
 		prompt := buildPrompt(history)
 
+		// Call the LLM
 		response, err := a.executor.Execute(systemPrompt, prompt)
 		if err != nil {
 			record := StepRecord{
@@ -126,6 +348,7 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 				fmt.Printf("├─ Step %d: ERROR — %v\n", step+1, err)
 			}
 
+			// Let the engine adapt (expand context, swap tools, etc.)
 			execResult := ctx.ExecutionResult{
 				Success:   false,
 				ErrorType: ctx.ErrToolFailed,
@@ -147,12 +370,16 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 
 		result.TotalTokens += response.TokensUsed
 
+		// Check if the MockExecutor already set a ToolCall (for demos/tests)
+		// Otherwise, parse the LLM's text response for tool call patterns
 		var toolCall *ToolCall
 		var finalText string
 
 		if response.ToolCall != nil {
+			// Mock executor or native function calling — tool call is pre-parsed
 			toolCall = response.ToolCall
 		} else {
+			// Real LLM — parse the text for TOOL_CALL: patterns
 			parsed := parseResponse(response.Text)
 			if parsed.toolCall != nil {
 				toolCall = parsed.toolCall
@@ -161,7 +388,25 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			}
 		}
 
+		// ── Case 1: Tool call ──
 		if toolCall != nil {
+			// Retry budget: if this tool has exceeded max retries, reject and force different tool
+			if toolRetries[toolCall.Name] >= a.config.MaxRetriesPerTool {
+				if a.config.Verbose {
+					fmt.Printf("├─ Step %d: RETRY_EXHAUSTED — %s exceeded %d retries, forcing different tool\n",
+						step+1, toolCall.Name, a.config.MaxRetriesPerTool)
+				}
+				result.Steps = append(result.Steps, StepRecord{
+					Step: step + 1, Action: "retry_exhausted", ToolName: toolCall.Name,
+					Output: fmt.Sprintf("tool %s exceeded retry budget (%d)", toolCall.Name, a.config.MaxRetriesPerTool),
+				})
+				history = append(history, message{
+					Role:    "user",
+					Content: fmt.Sprintf("Tool %s has failed too many times. Use a DIFFERENT tool or explain why no tool can answer this.", toolCall.Name),
+				})
+				continue
+			}
+
 			if a.config.Verbose {
 				fmt.Printf("├─ Step %d: TOOL_CALL — %s\n", step+1, toolCall.Name)
 			}
@@ -181,6 +426,7 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			if toolErr != nil {
 				record.Output = toolErr.Error()
 				record.Action = "tool_call_retry"
+				toolRetries[toolCall.Name]++ // track per-tool retry budget
 
 				if a.config.Verbose {
 					fmt.Printf("│  ↳ Failed: %v\n", toolErr)
@@ -190,7 +436,7 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 					Success:     false,
 					ToolUsed:    toolCall.Name,
 					ToolsFailed: []string{toolCall.Name},
-					ErrorType:   ctx.ErrToolFailed,
+					ErrorType:   classifyToolError(toolErr),
 					ErrorMsg:    toolErr.Error(),
 					TokensUsed:  response.TokensUsed,
 					Latency:     response.Latency,
@@ -206,12 +452,14 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 					}
 				}
 
+				// Add failure to history so LLM tries a different approach
 				history = append(history, message{
 					Role:    "assistant",
 					Content: fmt.Sprintf("I tried to call %s but it failed: %s", toolCall.Name, toolErr.Error()),
 				})
 			} else {
 				record.Output = toolCall.Result
+				toolCallSucceeded = true // grounding gate: real data obtained
 
 				if a.config.Verbose {
 					preview := toolCall.Result
@@ -221,6 +469,7 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 					fmt.Printf("│  ↳ Result: %s\n", preview)
 				}
 
+				// Record success with the engine (updates ranking + memory)
 				execResult := ctx.ExecutionResult{
 					Success:    true,
 					ToolUsed:   toolCall.Name,
@@ -229,6 +478,8 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 				}
 				a.engine.AdaptContext(plan, execResult)
 
+				// KEY FIX: Feed tool result back to the LLM.
+				// Without this, the LLM never sees the real data and hallucinates.
 				history = append(history, message{
 					Role:    "assistant",
 					Content: fmt.Sprintf("I called %s and got results.", toolCall.Name),
@@ -243,6 +494,27 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			result.Steps = append(result.Steps, record)
 			continue
 		}
+
+		// ── GROUNDING GATE ──
+		// If tools were loaded but none succeeded, the LLM is answering
+		// from memory — reject and force tool use to prevent hallucination.
+		if toolsWereLoaded && !toolCallSucceeded {
+			if a.config.Verbose {
+				fmt.Printf("├─ Step %d: GROUNDING GATE — rejecting ungrounded answer, forcing tool use\n", step+1)
+			}
+			result.Steps = append(result.Steps, StepRecord{
+				Step: step + 1, Action: "grounding_rejected",
+				Output: "Answer rejected: tools available but none called successfully",
+				Tokens: response.TokensUsed, Duration: time.Since(stepStart),
+			})
+			history = append(history, message{
+				Role:    "user",
+				Content: "You MUST call a tool before answering. Do NOT answer from memory. Use one of the available tools to get real data. Respond with TOOL_CALL: tool_name({\"params\"}).",
+			})
+			continue
+		}
+
+		// ── Case 2: Final answer (grounded or no tools needed) ──
 		record := StepRecord{
 			Step:     step + 1,
 			Action:   "complete",
@@ -267,14 +539,62 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 
 	result.TotalTime = time.Since(startTime)
 
+	// Record cost for each step from token data
+	for _, step := range result.Steps {
+		costTracker.RecordStep(step.Step, step.Tokens, step.Tokens, step.Action, step.ToolName, step.Duration)
+	}
+
+	// Generate cost report (the decision cost graph)
+	result.CostReport = costTracker.Report()
+
 	if a.config.Verbose {
 		fmt.Printf("│\n")
-		fmt.Printf("└─ Done: %d steps, %d tokens, %v\n",
-			len(result.Steps), result.TotalTokens, result.TotalTime.Round(time.Millisecond))
+		if result.CostReport.TotalCost > 0 {
+			fmt.Printf("└─ Done: %d steps, %d tokens, %v | Cost: $%.6f\n",
+				len(result.Steps), result.TotalTokens, result.TotalTime.Round(time.Millisecond),
+				result.CostReport.TotalCost)
+		} else {
+			fmt.Printf("└─ Done: %d steps, %d tokens, %v | Cost: $0 (local model)\n",
+				len(result.Steps), result.TotalTokens, result.TotalTime.Round(time.Millisecond))
+		}
 	}
+
+	// Record metrics for production observability
+	a.Metrics.recordTask(result)
 
 	return result
 }
+
+// ──────────────────────────────────────────────────────────
+// Error Taxonomy — maps tool errors to engine adaptive strategies
+// ──────────────────────────────────────────────────────────
+
+// classifyToolError examines error messages and maps them to the engine's
+// ErrorType enum. This unlocks distinct adaptive strategies instead of
+// collapsing everything to ErrToolFailed.
+func classifyToolError(err error) ctx.ErrorType {
+	msg := err.Error()
+	if strings.Contains(msg, "missing required params") || strings.Contains(msg, "params required") {
+		return ctx.ErrToolMisuse // → engine upgrades to full schema
+	}
+	if strings.Contains(msg, "no handler") {
+		return ctx.ErrToolNotFound // → engine expands context
+	}
+	if strings.Contains(msg, "404") || strings.Contains(msg, "Not Found") {
+		return ctx.ErrToolFailed // → engine swaps tool
+	}
+	if strings.Contains(msg, "401") || strings.Contains(msg, "403") || strings.Contains(msg, "auth") {
+		return ctx.ErrToolFailed // → engine swaps tool
+	}
+	if strings.Contains(msg, "429") || strings.Contains(msg, "rate") {
+		return ctx.ErrToolFailed // → engine retries
+	}
+	return ctx.ErrToolFailed
+}
+
+// ──────────────────────────────────────────────────────────
+// System Prompt — tells the LLM how to use tools
+// ──────────────────────────────────────────────────────────
 
 func buildSystemPrompt(toolContext string, loadedTools []string) string {
 	if len(loadedTools) == 0 {
@@ -305,11 +625,17 @@ func buildSystemPrompt(toolContext string, loadedTools []string) string {
 	return sb.String()
 }
 
+// ──────────────────────────────────────────────────────────
+// Conversation History
+// ──────────────────────────────────────────────────────────
+
 type message struct {
 	Role    string
 	Content string
 }
 
+// buildPrompt combines conversation history into a single prompt.
+// For providers that use a single prompt string (Ollama /api/generate).
 func buildPrompt(history []message) string {
 	if len(history) == 1 {
 		return history[0].Content
@@ -330,11 +656,17 @@ func buildPrompt(history []message) string {
 	return sb.String()
 }
 
+// ──────────────────────────────────────────────────────────
+// Response Parser — detects tool calls in LLM text output
+// ──────────────────────────────────────────────────────────
+
 type parsedResponse struct {
 	text     string
 	toolCall *ToolCall
 }
 
+// parseResponse examines LLM output for tool call patterns.
+// Looks for: TOOL_CALL: tool_name({"param": "value"})
 func parseResponse(text string) parsedResponse {
 	lines := strings.Split(text, "\n")
 	for _, line := range lines {
@@ -420,10 +752,17 @@ func parseParams(s string) map[string]interface{} {
 	return params
 }
 
+// ──────────────────────────────────────────────────────────
+// Mock implementations (testing + demos)
+// ──────────────────────────────────────────────────────────
+
+// MockExecutor returns pre-configured responses in sequence.
 type MockExecutor struct {
 	Responses []MockResponse
 	callIndex int
 }
+
+// MockResponse defines what the mock LLM should return.
 type MockResponse struct {
 	Text     string
 	ToolName string
@@ -431,6 +770,7 @@ type MockResponse struct {
 	Error    error
 }
 
+// Execute returns the next queued response.
 func (m *MockExecutor) Execute(context string, task string) (*ModelResponse, error) {
 	if m.callIndex >= len(m.Responses) {
 		return &ModelResponse{
@@ -463,11 +803,13 @@ func (m *MockExecutor) Execute(context string, task string) (*ModelResponse, err
 	return mr, nil
 }
 
+// MockToolHandler returns pre-configured results for tool calls.
 type MockToolHandler struct {
 	Results map[string]string
 	Errors  map[string]error
 }
 
+// Handle returns the mock result or error for a tool call.
 func (m *MockToolHandler) Handle(call *ToolCall) error {
 	if err, ok := m.Errors[call.Name]; ok {
 		call.Error = err
@@ -481,12 +823,20 @@ func (m *MockToolHandler) Handle(call *ToolCall) error {
 	return nil
 }
 
+// ──────────────────────────────────────────────────────────
+// Demo (uses mocks — no API keys needed)
+// ──────────────────────────────────────────────────────────
+
+// RunDemo shows two scenarios:
+//  1. Happy path: load tools → call → succeed
+//  2. Failure recovery: load tools → fail → adapt context → retry → succeed
 func RunDemo(mgr *ctx.Manager) {
 	fmt.Println()
 	fmt.Println(strings.Repeat("═", 60))
 	fmt.Println("  ARK Agent Runtime Demo")
 	fmt.Println(strings.Repeat("═", 60))
 
+	// ── Scenario 1: Happy path ──
 	fmt.Println()
 	fmt.Println("  ── Scenario 1: Happy Path ──")
 	fmt.Println("  Task: Create a pull request on github")
@@ -515,6 +865,7 @@ func RunDemo(mgr *ctx.Manager) {
 	fmt.Println("  Trace:")
 	fmt.Println(engine1.TracerRef().PrintTrace(result1.TraceID))
 
+	// ── Scenario 2: Failure → Adapt → Retry ──
 	fmt.Println("  ── Scenario 2: Failure → Adapt → Retry ──")
 	fmt.Println("  Task: Search jira issues (tool fails first, engine adapts)")
 	fmt.Println()

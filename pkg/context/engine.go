@@ -467,6 +467,13 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 	blocks := mgr.AllBlocks()
 	ranked := make([]RankedTool, 0)
 
+	// Collect and sort IDs for deterministic iteration (map order is random)
+	blockIDs := make([]string, 0, len(blocks))
+	for id := range blocks {
+		blockIDs = append(blockIDs, id)
+	}
+	sort.Strings(blockIDs)
+
 	maxTokens := 1
 	for _, block := range blocks {
 		if block.Type == BlockTool && block.TokenCount > maxTokens {
@@ -474,7 +481,8 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 		}
 	}
 
-	for id, block := range blocks {
+	for _, id := range blockIDs {
+		block := blocks[id]
 		if block.Type != BlockTool {
 			continue
 		}
@@ -561,8 +569,12 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 		ranked = append(ranked, rt)
 	}
 
-	sort.Slice(ranked, func(i, j int) bool {
-		return ranked[i].Score > ranked[j].Score
+	// Stable sort with ID tiebreaker — same input always produces same ranking
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].Score != ranked[j].Score {
+			return ranked[i].Score > ranked[j].Score
+		}
+		return ranked[i].ID < ranked[j].ID
 	})
 
 	return ranked
@@ -651,9 +663,15 @@ func (r *ToolRanker) persistPattern(pattern string, entry *MemoryEntry) {
 	if r.store == nil {
 		return
 	}
+	// CRITICAL: deep-copy the map. entry.SuccessfulTools is mutable and
+	// shared with the engine. The store worker runs asynchronously.
+	toolsCopy := make(map[string]int, len(entry.SuccessfulTools))
+	for k, v := range entry.SuccessfulTools {
+		toolsCopy[k] = v
+	}
 	if err := r.store.SavePattern(store.QueryPatternRecord{
 		Pattern:         pattern,
-		SuccessfulTools: entry.SuccessfulTools,
+		SuccessfulTools: toolsCopy,
 		TotalQueries:    entry.TotalQueries,
 		LastUsed:        entry.LastUsed,
 	}); err != nil {
@@ -711,9 +729,12 @@ func (cm *ContextMemory) QueryBonus(toolID string, queryWords []string) float64 
 
 		similarity := float64(overlap) / float64(max(len(patternWords), len(queryWords)))
 
-		if count, ok := entry.SuccessfulTools[toolID]; ok && entry.TotalQueries > 0 {
-			successRate := float64(count) / float64(entry.TotalQueries)
-			bonus := similarity * successRate * 0.15
+		if count, ok := entry.SuccessfulTools[toolID]; ok && count > 0 {
+			// Bonus scales with similarity AND accumulated evidence for THIS tool.
+			// More successes for this specific tool = higher bonus.
+			// Not divided by TotalQueries — other tools' success doesn't dilute this tool.
+			dataBonusFactor := float64(count) / (float64(count) + 2.0) // 1→0.33, 2→0.50, 5→0.71
+			bonus := similarity * dataBonusFactor * 0.40               // ceiling grows with evidence
 			if bonus > bestBonus {
 				bestBonus = bonus
 			}
