@@ -153,3 +153,77 @@ type mockExecutor struct{}
 func (m *mockExecutor) Execute(config HTTPToolConfig, params map[string]interface{}) (string, error) {
 	return "mock", nil
 }
+
+func TestOutputValidationRejectsEmpty(t *testing.T) {
+	router := NewRouterWithExecutor(&mockExecutor{})
+	router.RegisterTool(Tool{
+		Name:    "empty_tool",
+		Version: "v1",
+		Handler: func(p map[string]interface{}) (string, error) { return "", nil },
+	})
+
+	call := &runtime.ToolCall{Name: "empty_tool", Params: map[string]interface{}{}}
+	err := router.Handle(call)
+	if err == nil {
+		t.Fatal("expected error for empty output")
+	}
+	if call.Result != "" {
+		t.Error("result should be empty when output validation fails")
+	}
+	t.Logf("Correctly rejected empty output: %v", err)
+}
+
+func TestOutputValidationRejectsBinaryGarbage(t *testing.T) {
+	router := NewRouterWithExecutor(&mockExecutor{})
+	// Simulate gzipped/binary response
+	garbage := "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0b\x0c\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+	router.RegisterTool(Tool{
+		Name:    "binary_tool",
+		Version: "v1",
+		Handler: func(p map[string]interface{}) (string, error) { return garbage, nil },
+	})
+
+	call := &runtime.ToolCall{Name: "binary_tool", Params: map[string]interface{}{}}
+	err := router.Handle(call)
+	if err == nil {
+		t.Fatal("expected error for binary garbage output")
+	}
+	t.Logf("Correctly rejected binary garbage: %v", err)
+}
+
+func TestOutputValidationAcceptsJSON(t *testing.T) {
+	router := NewRouterWithExecutor(&mockExecutor{})
+	router.RegisterTool(Tool{
+		Name:    "json_tool",
+		Version: "v1",
+		Handler: func(p map[string]interface{}) (string, error) {
+			return `[{"title":"Test","url":"https://example.com"}]`, nil
+		},
+	})
+
+	call := &runtime.ToolCall{Name: "json_tool", Params: map[string]interface{}{}}
+	err := router.Handle(call)
+	if err != nil {
+		t.Fatalf("valid JSON output should pass validation: %v", err)
+	}
+	if call.Result == "" {
+		t.Error("result should not be empty for valid output")
+	}
+}
+
+func TestOutputValidationAcceptsPlainText(t *testing.T) {
+	router := NewRouterWithExecutor(&mockExecutor{})
+	router.RegisterTool(Tool{
+		Name:    "text_tool",
+		Version: "v1",
+		Handler: func(p map[string]interface{}) (string, error) {
+			return "This is a normal text response with results.", nil
+		},
+	})
+
+	call := &runtime.ToolCall{Name: "text_tool", Params: map[string]interface{}{}}
+	err := router.Handle(call)
+	if err != nil {
+		t.Fatalf("valid text output should pass validation: %v", err)
+	}
+}

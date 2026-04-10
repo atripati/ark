@@ -71,6 +71,33 @@ func RegisterGitHubFromEnv(router *Router) {
 	RegisterGitHub(router, os.Getenv("GITHUB_TOKEN"))
 }
 
+type ToolDef struct {
+	ID, Name, Desc, Schema string
+}
+
+func GitHubToolDefs() []ToolDef {
+	return []ToolDef{
+		{"github_list_repos", "github_list_repos",
+			"list repos: list GitHub repositories for a user or organization",
+			`{"name":"github_list_repos","description":"List GitHub repositories for a user","params":["user"]}`},
+		{"github_get_repo", "github_get_repo",
+			"get repo: get details of a specific GitHub repository",
+			`{"name":"github_get_repo","description":"Get repository details","params":["owner","repo"]}`},
+		{"github_list_issues", "github_list_issues",
+			"list issues: list issues in a GitHub repository",
+			`{"name":"github_list_issues","description":"List issues in a repository","params":["owner","repo"]}`},
+		{"github_create_issue", "github_create_issue",
+			"create issue: create a new issue in a GitHub repository",
+			`{"name":"github_create_issue","description":"Create a new issue","params":["owner","repo","title"]}`},
+		{"github_list_pulls", "github_list_pulls",
+			"list pulls: list pull requests in a GitHub repository",
+			`{"name":"github_list_pulls","description":"List pull requests","params":["owner","repo"]}`},
+		{"github_get_user", "github_get_user",
+			"get user: get GitHub user information",
+			`{"name":"github_get_user","description":"Get authenticated user info","params":[]}`},
+	}
+}
+
 type githubTools struct {
 	exec  Executor
 	token string
@@ -90,8 +117,6 @@ func (g *githubTools) headers() map[string]string {
 func (g *githubTools) listRepos(params map[string]interface{}) (string, error) {
 	user, _ := params["user"].(string)
 
-	// If no user specified and no token, we can't hit /user/repos (requires auth).
-	// Return a clear error so the LLM knows to provide a username.
 	if user == "" && g.token == "" {
 		return "", fmt.Errorf("github_list_repos: 'user' param required when no GITHUB_TOKEN is set (e.g. {\"user\": \"openai\"})")
 	}

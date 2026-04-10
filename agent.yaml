@@ -6,8 +6,8 @@ version: "0.1"
 
 # Model configuration (swap providers with a single line change)
 model:
-  provider: openai  # anthropic | openai | ollama
-  name: gpt-4o-mini
+  provider: ollama  # anthropic | openai | ollama
+  name: llama3
   max_tokens: 4096
 
 # Context budget (ARK's killer feature)
@@ -23,15 +23,36 @@ context:
   timeout_seconds: 120 # wall-clock timeout (increase for slow models)
 
 # Tools available to this agent
+# Built-in: GitHub (always on), Web Search (needs BRAVE_API_KEY), File System (always on)
+#
+# Custom HTTP tools — connect ARK to any API:
 tools:
-  - name: github
-    type: mcp
-    uri: "https://github.mcp.example.com"
-    # ARK will compress these schemas and lazy-load them
-    
-  - name: search
-    type: function
-    description: "Search the web"
+  # Example: Weather API
+  # - name: get_weather
+  #   type: http
+  #   method: GET
+  #   uri: "https://api.openweathermap.org/data/2.5/weather?q={city}&appid=${OPENWEATHER_KEY}"
+  #   description: "get current weather for a city"
+  #   params:
+  #     - city
+  #
+  # Example: Slack message (write operation — requires --allow-write)
+  # - name: slack_post
+  #   type: http
+  #   method: POST
+  #   uri: "https://slack.com/api/chat.postMessage"
+  #   description: "post a message to a Slack channel"
+  #   params:
+  #     - channel
+  #     - text
+  #   headers:
+  #     Authorization: "Bearer ${SLACK_TOKEN}"
+  #   write: true
+  #
+  # Headers support ${ENV_VAR} interpolation for secrets.
+  # Write tools are blocked unless --allow-write is passed.
+  # Domains are auto-allowlisted from the URI.
+  # ARK ranks, learns, and tracks cost for custom tools automatically.
     
 # Memory configuration
 memory:

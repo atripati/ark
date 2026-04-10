@@ -128,18 +128,19 @@ No API keys needed for any demo. Zero external dependencies.
 ## Run a Real Agent
 
 ```bash
-# With Anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-go run ./cmd/ark run agent.yaml --task "list my github repos"
-
-# With OpenAI
-export OPENAI_API_KEY=sk-...
-# edit agent.yaml: provider: openai, name: gpt-4o
-go run ./cmd/ark run agent.yaml --task "list my github repos"
-
 # With Ollama (free, local)
-# edit agent.yaml: provider: ollama, name: llama3
-go run ./cmd/ark run agent.yaml --task "list my github repos"
+go run ./cmd/ark run agent.yaml --task "list repos for openai"
+go run ./cmd/ark run agent.yaml --task "list files in the current directory"
+go run ./cmd/ark run agent.yaml --task "read the README.md file and summarize it"
+
+# With OpenAI (needs API key, ~$0.0005 per task)
+export OPENAI_API_KEY=sk-...
+# edit agent.yaml: provider: openai, name: gpt-4o-mini
+go run ./cmd/ark run agent.yaml --task "list repos for openai"
+
+# With web search (needs free Brave API key)
+export BRAVE_API_KEY=BSA...
+go run ./cmd/ark run agent.yaml --task "what is the latest news about AI agents"
 ```
 
 ## Safety
@@ -153,7 +154,45 @@ ark run agent.yaml --task "create issue" --allow-write  # ✅ opt-in
 ark run agent.yaml --task "create issue" --dry-run      # ✅ simulate
 ```
 
-Additional protections: domain allowlist (only `api.github.com` by default), output sanitization (4000 char cap), full audit traces for every context decision.
+Additional protections: domain allowlist, output validation (catches binary/garbage before LLM), output sanitization (4000 char cap), full audit traces for every context decision.
+
+## Connect Any API
+
+Define custom HTTP tools in `agent.yaml`. ARK handles the rest — domain allowlisting, parameter validation, cost tracking, and learning.
+
+```yaml
+tools:
+  - name: get_weather
+    type: http
+    method: GET
+    uri: "https://api.openweathermap.org/data/2.5/weather?q={city}&appid=${OPENWEATHER_KEY}"
+    description: "get current weather for a city"
+    params:
+      - city
+
+  - name: slack_post
+    type: http
+    method: POST
+    uri: "https://slack.com/api/chat.postMessage"
+    description: "post a message to a Slack channel"
+    params:
+      - channel
+      - text
+    headers:
+      Authorization: "Bearer ${SLACK_TOKEN}"
+    write: true   # requires --allow-write
+```
+
+Headers support `${ENV_VAR}` interpolation for secrets. Write operations are blocked by default. Domains are auto-allowlisted from the URI. ARK ranks, learns, and tracks cost for custom tools automatically — no extra code needed.
+
+## Built-in Tools
+
+| Server | Tools | Key Required |
+|--------|-------|-------------|
+| GitHub | list_repos, get_repo, list_issues, create_issue, list_pulls, get_user | GITHUB_TOKEN (optional) |
+| Web Search | web_search, web_search_news | BRAVE_API_KEY |
+| File System | file_read, file_write, file_list | None (local) |
+| Custom HTTP | Any REST API | Defined in agent.yaml |
 
 ## Stress Tested
 
@@ -210,14 +249,19 @@ ark/
 │   │   ├── store.go            Channel worker, snapshot semantics, decay
 │   │   └── store_test.go       5 tests
 │   └── tools/                  Real tool execution
-│       ├── http.go             Router, param validation, safety layer
-│       ├── http_test.go        8 tests
-│       └── github.go           6 GitHub API tools with RequiredParams
+│       ├── http.go             Router, param validation, output validation, safety
+│       ├── http_test.go        12 tests
+│       ├── github.go           6 GitHub API tools
+│       ├── websearch.go        2 Brave Search tools (web + news)
+│       ├── filesystem.go       3 file system tools (read/write/list)
+│       ├── filesystem_test.go  12 tests
+│       ├── custom.go           Custom HTTP tool engine (any API via agent.yaml)
+│       └── custom_test.go      10 tests
 ├── LICENSE                     Apache 2.0
 ├── NOTICE                      Attribution
 └── README.md
 
-67 tests | Race detector clean | 30-run stress test passed
+93 tests | Race detector clean | 11 tools across 3 servers
 ```
 
 ## How the Scoring Works
@@ -262,7 +306,7 @@ Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved sc
 - [x] Execution bounds (MaxSteps, TotalTimeout, per-tool retry budget)
 - [x] 53 tests, race detector clean, 30-run stress test
 
-### v0.7 — Cost Attribution ✓ (current)
+### v0.7 — Cost Attribution ✓
 - [x] Decision-level cost graph (per-step, per-tool, per-action)
 - [x] Provider-aware pricing (Anthropic, OpenAI, Ollama)
 - [x] Accurate input/output token split (verified with OpenAI)
@@ -271,13 +315,21 @@ Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved sc
 - [x] Cost attribution (user_id, feature_id, session_id)
 - [x] Cross-task aggregation (cost by feature, by user, by tool)
 - [x] Human-readable trace (real dollars + score impact)
-- [x] 67 tests, race detector clean
 
-### v0.8 — Real Connectors (next)
-- [ ] MCP server connector (connect to live MCP servers)
-- [ ] Web search tool (Brave/SerpAPI)
-- [ ] File system tools (read/write local files)
-- [ ] Custom HTTP tool registration via agent.yaml
+### v0.8 — Tool Ecosystem ✓ (current)
+- [x] Web search (Brave Search API — web + news)
+- [x] File system tools (read/write/list with path safety)
+- [x] Custom HTTP tools (any API via agent.yaml)
+- [x] Output validation layer (catches garbage before LLM)
+- [x] Domain auto-allowlisting for custom tools
+- [x] Environment variable interpolation in headers (​${ENV_VAR})
+- [x] Clean tool registration (ToolDefs pattern)
+- [x] 93 tests, 11 tools across 3 servers
+
+### v0.9 — MCP Protocol (next)
+- [ ] MCP server connector (connect to live MCP servers over stdio/SSE)
+- [ ] Auto-discover tools from MCP server
+- [ ] ARK manages context for any MCP-connected tool
 
 ### v0.9 — Production Storage
 - [ ] SQLite backend (replace JSON file store)

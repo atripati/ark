@@ -148,15 +148,36 @@ context:
   timeout_seconds: 120 # wall-clock timeout (increase for slow models)
 
 # Tools available to this agent
+# Built-in: GitHub (always on), Web Search (needs BRAVE_API_KEY), File System (always on)
+#
+# Custom HTTP tools — connect ARK to any API:
 tools:
-  - name: github
-    type: mcp
-    uri: "https://github.mcp.example.com"
-    # ARK will compress these schemas and lazy-load them
-    
-  - name: search
-    type: function
-    description: "Search the web"
+  # Example: Weather API
+  # - name: get_weather
+  #   type: http
+  #   method: GET
+  #   uri: "https://api.openweathermap.org/data/2.5/weather?q={city}&appid=${OPENWEATHER_KEY}"
+  #   description: "get current weather for a city"
+  #   params:
+  #     - city
+  #
+  # Example: Slack message (write operation — requires --allow-write)
+  # - name: slack_post
+  #   type: http
+  #   method: POST
+  #   uri: "https://slack.com/api/chat.postMessage"
+  #   description: "post a message to a Slack channel"
+  #   params:
+  #     - channel
+  #     - text
+  #   headers:
+  #     Authorization: "Bearer ${SLACK_TOKEN}"
+  #   write: true
+  #
+  # Headers support ${ENV_VAR} interpolation for secrets.
+  # Write tools are blocked unless --allow-write is passed.
+  # Domains are auto-allowlisted from the URI.
+  # ARK ranks, learns, and tracks cost for custom tools automatically.
     
 # Memory configuration
 memory:
@@ -555,41 +576,68 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 		tools.RegisterGitHub(toolRouter, "")
 		fmt.Printf("  GitHub:   ⚠️  no GITHUB_TOKEN (read-only, 60 req/hr limit)\n")
 	}
-	//// i added this later because i was testing to get openai repo but zero tool was loading
-	githubToolDefs := []struct {
-		id, name, desc, schema string
-	}{
-		{"github_list_repos", "github_list_repos",
-			"list repos: list GitHub repositories for a user or organization",
-			`{"name":"github_list_repos","description":"List GitHub repositories for a user","params":["user"]}`},
-		{"github_get_repo", "github_get_repo",
-			"get repo: get details of a specific GitHub repository",
-			`{"name":"github_get_repo","description":"Get repository details","params":["owner","repo"]}`},
-		{"github_list_issues", "github_list_issues",
-			"list issues: list issues in a GitHub repository",
-			`{"name":"github_list_issues","description":"List issues in a repository","params":["owner","repo"]}`},
-		{"github_create_issue", "github_create_issue",
-			"create issue: create a new issue in a GitHub repository",
-			`{"name":"github_create_issue","description":"Create a new issue","params":["owner","repo","title"]}`},
-		{"github_list_pulls", "github_list_pulls",
-			"list pulls: list pull requests in a GitHub repository",
-			`{"name":"github_list_pulls","description":"List pull requests","params":["owner","repo"]}`},
-		{"github_get_user", "github_get_user",
-			"get user: get GitHub user information",
-			`{"name":"github_get_user","description":"Get authenticated user info","params":[]}`},
-	}
-	for _, t := range githubToolDefs {
-		mgr.RegisterTool(t.id, t.name, t.desc, t.schema)
+	// Register tool definitions with context manager for ranking
+	for _, t := range tools.GitHubToolDefs() {
+		mgr.RegisterTool(t.ID, t.Name, t.Desc, t.Schema)
 	}
 
-	for _, tool := range cfg.Tools {
-		if tool.Type == "http" && tool.URI != "" {
-			toolRouter.RegisterHTTP(tool.Name, tools.HTTPToolConfig{
-				Method:  "GET",
-				URL:     tool.URI,
-				Headers: map[string]string{},
-			})
+	// ── Web Search Tools ──
+	braveKey := os.Getenv("BRAVE_API_KEY")
+	if braveKey != "" {
+		tools.RegisterWebSearch(toolRouter, braveKey)
+		fmt.Printf("  Search:   ✅ Brave Search connected\n")
+		for _, t := range tools.WebSearchToolDefs() {
+			mgr.RegisterTool(t.ID, t.Name, t.Desc, t.Schema)
 		}
+	} else {
+		fmt.Printf("  Search:   ⚠️  no BRAVE_API_KEY (web search disabled)\n")
+	}
+
+	// ── File System Tools ──
+	tools.RegisterFileSystem(toolRouter)
+	for _, t := range tools.FileSystemToolDefs() {
+		mgr.RegisterTool(t.ID, t.Name, t.Desc, t.Schema)
+	}
+	if allowWrite {
+		fmt.Printf("  Files:    ✅ file system tools (read + write enabled)\n")
+	} else {
+		fmt.Printf("  Files:    ✅ file system tools (read-only, use --allow-write for writes)\n")
+	}
+
+	// ── Custom HTTP Tools (from agent.yaml) ──
+	customCount := 0
+	for _, tool := range cfg.Tools {
+		if tool.Type != "http" || tool.URI == "" {
+			continue
+		}
+
+		timeout := 30 * time.Second
+		if tool.Timeout > 0 {
+			timeout = time.Duration(tool.Timeout) * time.Second
+		}
+
+		err := tools.RegisterCustomHTTP(toolRouter, tools.CustomToolConfig{
+			Name:        tool.Name,
+			Description: tool.Description,
+			Method:      tool.Method,
+			URL:         tool.URI,
+			Params:      tool.Params,
+			Headers:     tool.Headers,
+			Body:        tool.Body,
+			Timeout:     timeout,
+			WriteOp:     tool.WriteOp,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠️  Custom tool %q: %v\n", tool.Name, err)
+			continue
+		}
+
+		def := tools.CustomToolDef(tool.Name, tool.Description, tool.Params)
+		mgr.RegisterTool(def.ID, def.Name, def.Desc, def.Schema)
+		customCount++
+	}
+	if customCount > 0 {
+		fmt.Printf("  Custom:   ✅ %d custom HTTP tool(s) registered\n", customCount)
 	}
 
 	fmt.Printf("  Tools:    %d registered\n", toolRouter.ToolCount())

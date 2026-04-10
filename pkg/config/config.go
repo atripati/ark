@@ -34,13 +34,19 @@ type ContextConfig struct {
 	MaxRetries            int     `json:"max_retries"`
 	MaxSteps              int     `json:"max_steps"`
 	TimeoutSeconds        int     `json:"timeout_seconds"`
-	MaxCostPerTask        float64 `json:"max_cost_per_task"` // USD budget cap per task (0 = unlimited)
+	MaxCostPerTask        float64 `json:"max_cost_per_task"`
 }
 type ToolConfig struct {
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	URI         string `json:"uri"`
-	Description string `json:"description"`
+	Name        string            `json:"name"`
+	Type        string            `json:"type"`
+	Method      string            `json:"method"`
+	URI         string            `json:"uri"`
+	Description string            `json:"description"`
+	Params      []string          `json:"params"`
+	Headers     map[string]string `json:"headers"`
+	Body        string            `json:"body"`
+	Timeout     int               `json:"timeout"`
+	WriteOp     bool              `json:"write"`
 }
 type MemoryConfig struct {
 	Backend string `json:"backend"`

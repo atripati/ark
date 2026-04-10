@@ -26,7 +26,7 @@ type Tool struct {
 	Version        string
 	Handler        ToolFunc
 	Metadata       map[string]interface{}
-	RequiredParams []string // validated before execution — runtime enforces correctness
+	RequiredParams []string
 }
 type ToolFunc func(params map[string]interface{}) (string, error)
 
@@ -39,6 +39,7 @@ type Router struct {
 
 var DefaultAllowedDomains = []string{
 	"api.github.com",
+	"api.search.brave.com",
 }
 
 func NewRouter() *Router {
@@ -100,7 +101,6 @@ func (r *Router) Handle(call *runtime.ToolCall) error {
 		return call.Error
 	}
 
-	// Parameter validation — runtime enforces correctness, not the LLM
 	if len(t.RequiredParams) > 0 {
 		var missing []string
 		for _, key := range t.RequiredParams {
@@ -122,6 +122,11 @@ func (r *Router) Handle(call *runtime.ToolCall) error {
 	if err != nil {
 		call.Error = err
 		return err
+	}
+
+	if quality := validateOutput(result); quality != "valid" {
+		call.Error = fmt.Errorf("ark/tools/%s: output_quality=%s (tool returned but output is unusable)", call.Name, quality)
+		return call.Error
 	}
 
 	call.Result = sanitizeOutput(result)
@@ -178,6 +183,15 @@ func NewHTTPExecutor(allowedDomains []string) *HTTPExecutor {
 		Client:         &http.Client{Timeout: 30 * time.Second},
 		AllowedDomains: allowedDomains,
 	}
+}
+
+func (h *HTTPExecutor) AddDomain(domain string) {
+	for _, d := range h.AllowedDomains {
+		if d == domain {
+			return // already allowed
+		}
+	}
+	h.AllowedDomains = append(h.AllowedDomains, domain)
 }
 func (h *HTTPExecutor) Execute(config HTTPToolConfig, params map[string]interface{}) (string, error) {
 	reqURL := config.URL
@@ -317,6 +331,28 @@ func sanitizeOutput(s string) string {
 	}
 	return s[:maxOutputLen] + "\n... [truncated by ARK: output exceeded " +
 		fmt.Sprintf("%d", maxOutputLen) + " chars]"
+}
+
+func validateOutput(result string) string {
+	if len(strings.TrimSpace(result)) == 0 {
+		return "empty_output"
+	}
+
+	nonPrintable := 0
+	sampleSize := len(result)
+	if sampleSize > 200 {
+		sampleSize = 200
+	}
+	for _, r := range result[:sampleSize] {
+		if r < 32 && r != '\n' && r != '\r' && r != '\t' {
+			nonPrintable++
+		}
+	}
+	if sampleSize > 0 && float64(nonPrintable)/float64(sampleSize) > 0.1 {
+		return "binary_garbage"
+	}
+
+	return "valid"
 }
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
