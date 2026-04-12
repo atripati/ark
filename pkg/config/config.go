@@ -23,6 +23,11 @@ type ModelConfig struct {
 	MaxTokens int    `json:"max_tokens"`
 	APIKey    string `json:"api_key"`
 	BaseURL   string `json:"base_url"`
+
+	// this is Model routing per step intelligence allocation
+	Strategy    string `json:"strategy"`     // this is for single | cost optimized | quality first
+	FastModel   string `json:"fast_model"`   // this is for cheap model for simple steps (e.g. gpt-4o-mini)
+	StrongModel string `json:"strong_model"` // this is for expensive model for complex reasoning (e.g. gpt-4o)
 }
 type ContextConfig struct {
 	TotalTokens           int     `json:"total_tokens"`
@@ -38,11 +43,11 @@ type ContextConfig struct {
 }
 type ToolConfig struct {
 	Name        string            `json:"name"`
-	Type        string            `json:"type"`
+	Type        string            `json:"type"` // this is "http", "mcp" (future)
 	Method      string            `json:"method"`
 	URI         string            `json:"uri"`
 	Description string            `json:"description"`
-	Params      []string          `json:"params"`
+	Params      []string          `json:"params"` // this is for required parameters
 	Headers     map[string]string `json:"headers"`
 	Body        string            `json:"body"`
 	Timeout     int               `json:"timeout"`
@@ -196,6 +201,12 @@ func (p *parser) applyScalar(section, key, val string) error {
 			p.cfg.Model.APIKey = val
 		case "base_url":
 			p.cfg.Model.BaseURL = val
+		case "strategy":
+			p.cfg.Model.Strategy = val
+		case "fast_model":
+			p.cfg.Model.FastModel = val
+		case "strong_model":
+			p.cfg.Model.StrongModel = val
 		}
 
 	case "context":

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/atripati/ark/pkg/config"
 	ctx "github.com/atripati/ark/pkg/context"
 	"github.com/atripati/ark/pkg/models"
+	modelrouter "github.com/atripati/ark/pkg/router"
 	"github.com/atripati/ark/pkg/runtime"
 	"github.com/atripati/ark/pkg/store"
 	"github.com/atripati/ark/pkg/tools"
@@ -642,6 +644,45 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 
 	fmt.Printf("  Tools:    %d registered\n", toolRouter.ToolCount())
 
+	// ── Model Router ──
+	// Wraps provider(s) to route each step to the optimal model.
+	var modelRouter *modelrouter.Router
+
+	strategy := modelrouter.Strategy(cfg.Model.Strategy)
+	if strategy == "" {
+		strategy = modelrouter.StrategySingle
+	}
+
+	if strategy == modelrouter.StrategyCostOptimized || strategy == modelrouter.StrategyQualityFirst {
+		// Dual-model routing: fast + strong
+		fastModelName := cfg.Model.FastModel
+		if fastModelName == "" {
+			fastModelName = cfg.Model.Name // fallback to default
+		}
+		strongModelName := cfg.Model.StrongModel
+		if strongModelName == "" {
+			strongModelName = cfg.Model.Name // fallback to default
+		}
+
+		fastProvider, fastErr := models.New(cfg.Model.Provider, fastModelName, cfg.Model.APIKey, cfg.Model.BaseURL, cfg.Model.MaxTokens)
+		strongProvider, strongErr := models.New(cfg.Model.Provider, strongModelName, cfg.Model.APIKey, cfg.Model.BaseURL, cfg.Model.MaxTokens)
+
+		if fastErr != nil || strongErr != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠️  Dual model setup failed, falling back to single model\n")
+			modelRouter = modelrouter.NewSingle(provider)
+		} else {
+			modelRouter = modelrouter.New(modelrouter.Config{
+				Strategy:    strategy,
+				FastModel:   modelrouter.ModelSpec{Name: fastModelName},
+				StrongModel: modelrouter.ModelSpec{Name: strongModelName},
+			}, fastProvider, strongProvider)
+			fmt.Printf("  Routing:  ✅ %s (fast=%s, strong=%s)\n", strategy, fastModelName, strongModelName)
+		}
+	} else {
+		// Single model — backwards compatible
+		modelRouter = modelrouter.NewSingle(provider)
+	}
+
 	agentConfig := runtime.DefaultAgentConfig()
 	agentConfig.Verbose = cfg.Tracing.Enabled
 	agentConfig.Provider = cfg.Model.Provider
@@ -655,7 +696,19 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	if cfg.Context.MaxCostPerTask > 0 {
 		agentConfig.MaxCostPerTask = cfg.Context.MaxCostPerTask
 	}
-	agent := runtime.NewAgent(engine, provider, toolRouter, agentConfig)
+	agent := runtime.NewAgent(engine, modelRouter, toolRouter, agentConfig)
+
+	// Load router learning from prior runs
+	routerLearningPath := "./ark-router-learning.json"
+	if modelRouter.Strategy() != modelrouter.StrategySingle {
+		if data, err := os.ReadFile(routerLearningPath); err == nil {
+			var snapshots []modelrouter.PerfSnapshot
+			if jsonErr := json.Unmarshal(data, &snapshots); jsonErr == nil && len(snapshots) > 0 {
+				modelRouter.ImportLearning(snapshots)
+				fmt.Printf("  Router:   ✅ loaded %d learned routing rules from %s\n", len(snapshots), routerLearningPath)
+			}
+		}
+	}
 
 	if task == "" {
 		fmt.Print("\n  📝 Enter task: ")
@@ -695,6 +748,19 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	// Print decision cost graph
 	if result.CostReport != nil {
 		fmt.Print(result.CostReport.Summary())
+	}
+
+	// Print model routing decisions
+	if modelRouter != nil && modelRouter.Strategy() != modelrouter.StrategySingle {
+		fmt.Print(modelRouter.FormatDecisions())
+
+		// Persist router learning for next run
+		snapshots := modelRouter.ExportLearning()
+		if len(snapshots) > 0 {
+			if data, err := json.MarshalIndent(snapshots, "", "  "); err == nil {
+				os.WriteFile(routerLearningPath, data, 0644)
+			}
+		}
 	}
 
 	fmt.Println()

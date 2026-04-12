@@ -6,16 +6,17 @@ version: "0.1"
 
 # Model configuration (swap providers with a single line change)
 model:
-  provider: ollama  # anthropic | openai | ollama
+  provider: ollama
   name: llama3
   max_tokens: 4096
+    
+  
 
 # Context budget (ARK's killer feature)
 # Instead of dumping all tool schemas into the prompt,
 # ARK dynamically loads only what's relevant.
 context:
   total_tokens: 200000
-  strategy: adaptive  # adaptive | static | manual
   tool_budget: 10%    # vs 30-50% with raw MCP
   memory_budget: 10%
   conversation_budget: 35%

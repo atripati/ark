@@ -1,13 +1,46 @@
 # ARK — AI Runtime Kernel
 
-> ARK dynamically controls what goes into an LLM’s context — reducing tool overhead by ~99%, learning from every execution, and attributing cost per decision.
+**Stop wasting agent context on unused tool schemas.**
 
-> An economically rational runtime for AI agents. Context optimization. Adaptive execution. Decision-level cost attribution.
+ARK is an open-source runtime in Go that makes AI agents faster, cheaper, and smarter:
 
+• **99% less context waste** — loads 3 relevant tools, not all 140
+• **Per-step model routing** — tool calls on cheap models, reasoning on strong models
+• **Cost per decision** — every step has a dollar amount, cost feeds back into ranking
+• **Learns across runs** — successful tools rise, failing tools drop, persists to disk
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![Tests](https://img.shields.io/badge/Tests-106%20passing-brightgreen?style=flat-square)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
+
+---
+
+## Model Router — the right model for each step
+
+ARK doesn’t use one model for everything. It routes each step to the optimal model automatically.
+
+```
+🧠 Model Routing:
+  Step 1 [tool_call] gpt-4o-mini  (tool calls are simple, using fast model to save cost)
+  Step 2 [tool_call] gpt-4o-mini  (tool calls are simple, using fast model to save cost)
+  Step 3 [complete]  gpt-4o       (final reasoning benefits from strong model)
+
+  Fast model: 2 steps | Strong model: 1 step
+```
+
+Configure in `agent.yaml`:
+```yaml
+model:
+  provider: openai
+  strategy: cost_optimized    # single | cost_optimized | quality_first
+  fast_model: gpt-4o-mini     # cheap: $0.15/M tokens
+  strong_model: gpt-4o        # powerful: $2.50/M tokens
+```
+
+The router learns from failures. If the fast model fails on a step type, ARK promotes it to the strong model next time. Learning persists across restarts.
+
+No other agent framework does this.
 
 ---
 
@@ -110,6 +143,20 @@ Scores and query patterns persist to disk. Run 2 is smarter than Run 1.
 ```
 
 Cost flows back into ranking: expensive tools get demoted, cheap reliable tools get promoted. ARK doesn’t just track cost — it acts on cost.
+
+**5. Multi-Step Tool Chaining** — ARK chains tools autonomously:
+
+```
+$ ark run agent.yaml --task "find the most starred repo for openai, then list its open issues"
+
+  Step 1: TOOL_CALL — github_list_repos     → found whisper (97,613 stars)
+  Step 2: TOOL_CALL — github_list_issues    → listed 10 open issues
+  Step 3: COMPLETE  — summarized results
+
+  Cost: $0.000847 | Time: 6.9s | Models: gpt-4o-mini (2 steps) + gpt-4o (1 step)
+```
+
+Three steps, two tool calls, two models, one coherent answer. Less than a tenth of a penny.
 
 ## Quick Start
 
@@ -222,6 +269,7 @@ Failures handled correctly:
 | Deterministic ranking | Sorted IDs, stable sort with tiebreaker |
 | Observable | RuntimeMetrics, TraceJSON export, per-tool latency P50 |
 | Cost-aware | Per-decision cost graph, budget enforcement, cost-weighted ranking |
+| Model routing | Per-step intelligence allocation, self-improving, persistent learning |
 
 ## Architecture
 
@@ -239,6 +287,9 @@ ark/
 │   │   └── engine_test.go      12 tests
 │   ├── models/                 LLM providers (Anthropic, OpenAI, Ollama)
 │   │   └── providers.go        Raw HTTP, retry + backoff, no SDKs
+│   ├── router/                 Per-step model routing
+│   │   ├── router.go           Step classifier, tier selection, persistent learning
+│   │   └── router_test.go      14 tests
 │   ├── runtime/                Agent execution loop
 │   │   ├── agent.go            ReAct loop, grounding gate, metrics, trace export
 │   │   └── agent_test.go       7 tests
@@ -261,7 +312,7 @@ ark/
 ├── NOTICE                      Attribution
 └── README.md
 
-93 tests | Race detector clean | 11 tools across 3 servers
+106 tests | Race detector clean | 11 tools across 3 servers | Per-step model routing
 ```
 
 ## How the Scoring Works
@@ -316,27 +367,36 @@ Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved sc
 - [x] Cross-task aggregation (cost by feature, by user, by tool)
 - [x] Human-readable trace (real dollars + score impact)
 
-### v0.8 — Tool Ecosystem ✓ (current)
+### v0.8 — Tool Ecosystem ✓
 - [x] Web search (Brave Search API — web + news)
 - [x] File system tools (read/write/list with path safety)
 - [x] Custom HTTP tools (any API via agent.yaml)
 - [x] Output validation layer (catches garbage before LLM)
 - [x] Domain auto-allowlisting for custom tools
-- [x] Environment variable interpolation in headers (​${ENV_VAR})
+- [x] Environment variable interpolation in headers (${ENV_VAR})
 - [x] Clean tool registration (ToolDefs pattern)
-- [x] 93 tests, 11 tools across 3 servers
 
-### v0.9 — MCP Protocol (next)
+### v0.9 — Model Router ✓ (current)
+- [x] Per-step model routing (tool calls → fast, reasoning → strong)
+- [x] 3 strategies: single, cost_optimized, quality_first
+- [x] Automatic fallback: fast fails → retry with strong
+- [x] Self-improving: learns which model works for each step type
+- [x] Persistent learning across restarts (ark-router-learning.json)
+- [x] Human-readable routing trace in output
+- [x] Backwards compatible (single model = default, zero config change)
+- [x] 106 tests, race detector clean
+
+### v1.0 — MCP Protocol (next)
 - [ ] MCP server connector (connect to live MCP servers over stdio/SSE)
 - [ ] Auto-discover tools from MCP server
 - [ ] ARK manages context for any MCP-connected tool
 
-### v0.9 — Production Storage
+### v1.1 — Production Storage
 - [ ] SQLite backend (replace JSON file store)
 - [ ] Multi-agent shared memory
 - [ ] Query pattern clustering (semantic, not keyword)
 
-### v1.0 — Production Runtime
+### v1.2 — Production Runtime
 - [ ] `ark run` with streaming output
 - [ ] Hot-reload agent configs
 - [ ] Plugin system for custom tools

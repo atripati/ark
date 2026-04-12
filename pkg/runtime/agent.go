@@ -35,6 +35,23 @@ type ToolHandler interface {
 	Handle(call *ToolCall) error
 }
 
+type StepAwareExecutor interface {
+	Executor
+	SetStep(step int, stepType string)
+}
+
+func classifyAgentStep(step int, isRetry bool, prevAction string) string {
+	if isRetry {
+		return "retry"
+	}
+	if prevAction == "tool_call" {
+		if step >= 3 {
+			return "complete"
+		}
+	}
+	return "tool_call"
+}
+
 type Agent struct {
 	engine   *ctx.Engine
 	executor Executor
@@ -285,6 +302,18 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 		stepStart := time.Now()
 
 		prompt := buildPrompt(history)
+
+		// these tell the router what step type this is (if router is being used).
+		// Finally this enables per-step model routing: tool calls → fast model, reasoning → strong model.
+		if sa, ok := a.executor.(StepAwareExecutor); ok {
+			isRetry := step > 0 && len(result.Steps) > 0 && strings.HasSuffix(result.Steps[len(result.Steps)-1].Action, "retry")
+			prevAction := ""
+			if len(result.Steps) > 0 {
+				prevAction = result.Steps[len(result.Steps)-1].Action
+			}
+			stepType := classifyAgentStep(step+1, isRetry, prevAction)
+			sa.SetStep(step+1, stepType)
+		}
 
 		response, err := a.executor.Execute(systemPrompt, prompt)
 		if err != nil {
