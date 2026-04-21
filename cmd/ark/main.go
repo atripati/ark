@@ -10,6 +10,7 @@ import (
 
 	"github.com/atripati/ark/pkg/config"
 	ctx "github.com/atripati/ark/pkg/context"
+	"github.com/atripati/ark/pkg/governor"
 	"github.com/atripati/ark/pkg/models"
 	modelrouter "github.com/atripati/ark/pkg/router"
 	"github.com/atripati/ark/pkg/runtime"
@@ -17,7 +18,7 @@ import (
 	"github.com/atripati/ark/pkg/tools"
 )
 
-const version = "0.4.0-alpha"
+const version = "1.0.0"
 
 const banner = `
     _    ____  _  __
@@ -573,7 +574,7 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	githubToken := os.Getenv("GITHUB_TOKEN")
 	if githubToken != "" {
 		tools.RegisterGitHub(toolRouter, githubToken)
-		fmt.Printf("  GitHub:   ✅ connected (%d tools)\n", 6)
+		fmt.Printf("  GitHub:   ✅ connected (%d tools)\n", 7)
 	} else {
 		tools.RegisterGitHub(toolRouter, "")
 		fmt.Printf("  GitHub:   ⚠️  no GITHUB_TOKEN (read-only, 60 req/hr limit)\n")
@@ -698,6 +699,37 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	}
 	agent := runtime.NewAgent(engine, modelRouter, toolRouter, agentConfig)
 
+	// ── Governor (Cognitive Supervisor) ──
+	// Loads the model capability registry and wires the verifier into the agent.
+	var govRegistry *governor.Registry
+
+	govRegistry = governor.NewRegistry()
+	registryPath := "ark-governor-registry.json"
+	if loadErr := govRegistry.Load(registryPath); loadErr != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠️  Governor registry: %v\n", loadErr)
+	} else {
+		// Decay stale profiles (older than 7 days lose weight)
+		decayed := govRegistry.DecayProfiles(7 * 24 * time.Hour)
+		profiles := govRegistry.AllProfiles()
+		if len(profiles) > 0 {
+			totalObs := 0
+			for _, p := range profiles {
+				totalObs += p.TotalCalls
+			}
+			msg := fmt.Sprintf("  Governor: ✅ loaded %d model profiles (%d observations)", len(profiles), totalObs)
+			if decayed > 0 {
+				msg += fmt.Sprintf(" (decayed %d stale profiles)", decayed)
+			}
+			fmt.Println(msg)
+		} else {
+			fmt.Printf("  Governor: ✅ cognitive supervisor active (learning)\n")
+		}
+	}
+
+	govVerifier := governor.NewVerifier(governor.DefaultVerifierConfig(), govRegistry)
+	gov := governor.NewGovernorForRuntime(govRegistry, govVerifier)
+	agent = runtime.NewAgentWithGovernor(engine, modelRouter, toolRouter, agentConfig, gov)
+
 	// Load router learning from prior runs
 	routerLearningPath := "./ark-router-learning.json"
 	if modelRouter.Strategy() != modelrouter.StrategySingle {
@@ -764,6 +796,18 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	}
 
 	fmt.Println()
+
+	// Save governor registry for next run
+	if govRegistry != nil {
+		if saveErr := govRegistry.Save(registryPath); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠️  Governor save: %v\n", saveErr)
+		} else {
+			profiles := govRegistry.AllProfiles()
+			if len(profiles) > 0 {
+				fmt.Printf("  Governor: ✅ saved %d model profiles to %s\n", len(profiles), registryPath)
+			}
+		}
+	}
 
 	if memStore != nil {
 		if err := memStore.Close(); err != nil {

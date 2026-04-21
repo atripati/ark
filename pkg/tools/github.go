@@ -66,6 +66,14 @@ func RegisterGitHub(router *Router, token string) {
 		RequiredParams: []string{},
 		Metadata:       map[string]interface{}{"type": "read", "auth_required": true, "method": "GET", "domain": "api.github.com"},
 	})
+	router.RegisterTool(Tool{
+		Name:           "github_search_repos",
+		Description:    "search repos: search GitHub repositories by topic, language, or keyword (best for finding top/popular/best repos)",
+		Version:        "v1",
+		Handler:        gh.searchRepos,
+		RequiredParams: []string{"query"},
+		Metadata:       map[string]interface{}{"type": "read", "auth_required": false, "method": "GET", "domain": "api.github.com"},
+	})
 }
 func RegisterGitHubFromEnv(router *Router) {
 	RegisterGitHub(router, os.Getenv("GITHUB_TOKEN"))
@@ -95,6 +103,9 @@ func GitHubToolDefs() []ToolDef {
 		{"github_get_user", "github_get_user",
 			"get user: get GitHub user information",
 			`{"name":"github_get_user","description":"Get authenticated user info","params":[]}`},
+		{"github_search_repos", "github_search_repos",
+			"search repos: search GitHub repositories by topic, language, or keyword (best for finding top/popular/best repos)",
+			`{"name":"github_search_repos","description":"Search GitHub repositories by keyword, topic, or language. Use for finding top, popular, or best repos.","params":["query"]}`},
 	}
 }
 
@@ -121,16 +132,17 @@ func (g *githubTools) listRepos(params map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("github_list_repos: 'user' param required when no GITHUB_TOKEN is set (e.g. {\"user\": \"openai\"})")
 	}
 
-	url := githubAPI + "/user/repos?per_page=10&sort=updated"
+	url := githubAPI + "/user/repos?per_page=30&sort=stars&direction=desc"
 	if user != "" {
-		url = fmt.Sprintf("%s/users/%s/repos?per_page=10&sort=updated", githubAPI, user)
+		// Use search API for user/org repos — returns sorted by stars correctly
+		url = fmt.Sprintf("%s/search/repositories?q=user:%s&sort=stars&order=desc&per_page=30", githubAPI, user)
 	}
 
 	if perPage, ok := params["per_page"]; ok {
-		url = strings.Replace(url, "per_page=10", fmt.Sprintf("per_page=%v", perPage), 1)
+		url = strings.Replace(url, "per_page=30", fmt.Sprintf("per_page=%v", perPage), 1)
 	}
 	if sort, ok := params["sort"]; ok {
-		url = strings.Replace(url, "sort=updated", fmt.Sprintf("sort=%v", sort), 1)
+		url = strings.Replace(url, "sort=stars", fmt.Sprintf("sort=%v", sort), 1)
 	}
 
 	result, err := g.exec.Execute(HTTPToolConfig{
@@ -265,15 +277,559 @@ func (g *githubTools) getUser(params map[string]interface{}) (string, error) {
 	return simplifyUser(result)
 }
 
+func (g *githubTools) searchRepos(params map[string]interface{}) (string, error) {
+	query, _ := params["query"].(string)
+	if query == "" {
+		return "", fmt.Errorf("github_search_repos: 'query' param required (e.g. {\"query\": \"python web framework\"})")
+	}
+
+	// this if PHASE 1: Query Intelligence
+	// Extract language + strip noise + add ecosystem anchors
+
+	lang, _ := params["language"].(string)
+	if lang == "" {
+		lang = detectLanguage(query)
+	}
+
+	// this is to Strip noise words — keep only domain keywords
+	cleanQuery := stripNoiseWords(query)
+
+	// this is the Ecosystem that  hints to disambiguate (javascript→nodejs, go→golang)
+	ecosystemHints := map[string]string{
+		"javascript": "nodejs",
+		"typescript": "nodejs",
+		"go":         "golang",
+		"c#":         "dotnet",
+		"csharp":     "dotnet",
+	}
+
+	// this is PHASE 2: basically this is Retrieval whihch means it:
+	// Keep language in the query for signal strength.
+	// The noise word stripper already removed "backend", "frontend", "server"
+	// which were causing strict AND failures on GitHub.
+
+	var allRepos []map[string]interface{}
+
+	searchQ := strings.ReplaceAll(cleanQuery, " ", "+")
+	if hint, ok := ecosystemHints[strings.ToLower(lang)]; ok {
+		searchQ += "+" + hint
+	}
+
+	// This is For languages with ecosystem overlap (JS includes TS, and vice versa),
+	// This don't add language: filter to the API — it would exclude valid repos.
+	// My local filterByLanguage handles the cross-language matching.
+	langOverlap := map[string]bool{
+		"javascript": true,
+		"typescript": true,
+	}
+	if lang != "" && !langOverlap[strings.ToLower(lang)] {
+		searchQ += "+language:" + strings.ToLower(lang)
+	}
+
+	url := fmt.Sprintf("%s/search/repositories?q=%s&sort=stars&order=desc&per_page=30",
+		githubAPI, searchQ)
+
+	result, err := g.exec.Execute(HTTPToolConfig{
+		Method:  "GET",
+		URL:     url,
+		Headers: g.headers(),
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("github_search_repos: %w", err)
+	}
+
+	allRepos = parseSearchResults(result)
+
+	// this is my PHASE 3: whihc is Hard language filter
+	if lang != "" {
+		allRepos = filterByLanguage(allRepos, lang)
+	}
+
+	// this is PHASE 4 for Junk filtering
+	allRepos = filterJunkRepos(allRepos)
+
+	// this is PHASE 4.5 for  Relevance scoring
+	// Three-tier scoring:
+	//  Positive match (web framework signal) → 2.0x boost
+	//  No match (unknown relevance)          → 0.3x penalty
+	//  Anti-match (clearly wrong category)   → 0.01x buried
+	// This ensures only repos with framework signals rank high.
+
+	webFrameworkSignals := []string{
+		"web framework", "http framework", "api framework",
+		"rest framework", "rest api", "restful",
+		"web server", "http server",
+		"web application framework", "server framework",
+		"micro framework", "microframework",
+		"web development framework",
+		"web application", "http routing",
+		"server-side applications", "server-side",
+		"node.js framework", "nodejs framework",
+		"progressive node", "minimalist web",
+	}
+
+	antiSignals := []string{
+		// Data/ORM
+		"orm", "object-relational", "datastore", "database",
+		// Cloud/serverless
+		"lambda", "aws lambda", "serverless middleware",
+		// Frontend/CSS
+		"css framework", "css-in-js", "lightweight css",
+		// Debugging/profiling
+		"memory leak", "heap snapshot", "debugging", "profiling",
+		// Build tools
+		"compiler", "bundler", "build tool",
+		// Infrastructure
+		"queue", "cache", "message broker",
+		// Testing
+		"testing framework", "test framework", "test runner",
+		"end-to-end test", "unit test", "e2e test",
+		// Bots/chat
+		"bot framework", "chatbot", "bot sdk", "conversational",
+		// Desktop/mobile
+		"desktop app", "mobile app", "app platform",
+		// Static/frontend
+		"static site", "jamstack", "site generator",
+		// Learning resources
+		"cheatsheet", "curated list", "tutorial",
+		"interview question", "roadmap",
+		// CLI/workflow tools
+		"alfred workflow", "command line", "cli tool", "command-line",
+		// Scraping/crawling (not web serving)
+		"scraping", "crawling", "crawler", "scraper", "spider",
+		// Error handling libraries
+		"error handling", "error library",
+		// Utility libraries
+		"utility", "helper library", "collection of functions",
+		// Blog/CMS frameworks (not backend web frameworks)
+		"blog framework", "blog platform", "blogging",
+		// AI/ML frameworks (not web frameworks)
+		"ai-powered", "ai framework", "machine learning framework",
+		"llm framework", "ai agent",
+		// Realtime-only libraries (not full web frameworks)
+		"realtime application framework", "realtime app framework",
+	}
+	//still i need to work on this to make it more then perfect
+
+	type scoredRepo struct {
+		repo  map[string]interface{}
+		score float64
+	}
+
+	scored := make([]scoredRepo, 0, len(allRepos))
+	for _, r := range allRepos {
+		desc := strings.ToLower(fmt.Sprintf("%v", r["description"]))
+		name := strings.ToLower(fmt.Sprintf("%v", r["name"]))
+		stars := toFloat(r["stargazers_count"])
+
+		// this if to check anti-signals first (highest priority)
+		isAnti := false
+		for _, sig := range antiSignals {
+			if strings.Contains(desc, sig) || strings.Contains(name, sig) {
+				isAnti = true
+				break
+			}
+		}
+
+		// this is to check positive signals
+		isPositive := false
+		for _, sig := range webFrameworkSignals {
+			if strings.Contains(desc, sig) || strings.Contains(name, sig) {
+				isPositive = true
+				break
+			}
+		}
+
+		// this is to kip awesome-lists entirely
+		if strings.HasPrefix(name, "awesome") || strings.Contains(name, "awesome-") {
+			continue
+		}
+
+		// This is three-tier relevance scoring
+		var relevance float64
+		if isAnti {
+			relevance = 0.01
+		} else if isPositive {
+			relevance = 2.0
+		} else {
+			relevance = 0.3
+		}
+
+		scored = append(scored, scoredRepo{repo: r, score: stars * relevance})
+	}
+
+	for i := 1; i < len(scored); i++ {
+		for j := i; j > 0; j-- {
+			if scored[j].score > scored[j-1].score {
+				scored[j], scored[j-1] = scored[j-1], scored[j]
+			}
+		}
+	}
+
+	allRepos = make([]map[string]interface{}, 0, len(scored))
+	for _, s := range scored {
+		allRepos = append(allRepos, s.repo)
+	}
+	// here was phase 5 whihc i deleted as i have to work on it
+
+	// this is PHASE 6: Diversity guard
+	// Max 2 repos per owner to prevent clustering
+	ownerSeen := make(map[string]int)
+	diverse := make([]map[string]interface{}, 0)
+	for _, r := range allRepos {
+		owner := ""
+		if fn, ok := r["full_name"].(string); ok {
+			parts := strings.SplitN(fn, "/", 2)
+			if len(parts) > 0 {
+				owner = strings.ToLower(parts[0])
+			}
+		}
+		ownerSeen[owner]++
+		if ownerSeen[owner] <= 2 {
+			diverse = append(diverse, r)
+		}
+	}
+
+	// this is PHASE 7: Simplify output
+	if len(diverse) > maxListItems {
+		diverse = diverse[:maxListItems]
+	}
+
+	simple := make([]map[string]interface{}, 0, len(diverse))
+	for _, r := range diverse {
+		simple = append(simple, stripNulls(map[string]interface{}{
+			"name":        r["name"],
+			"full_name":   r["full_name"],
+			"description": r["description"],
+			"language":    r["language"],
+			"stars":       r["stargazers_count"],
+			"forks":       r["forks_count"],
+			"url":         r["html_url"],
+		}))
+	}
+
+	out, _ := json.Marshal(simple)
+	return string(out), nil
+}
+
+func parseSearchResults(raw string) []map[string]interface{} {
+	var repos []map[string]interface{}
+
+	// Try search API format first
+	var searchResult map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &searchResult); err == nil {
+		if items, ok := searchResult["items"].([]interface{}); ok {
+			for _, item := range items {
+				if m, ok := item.(map[string]interface{}); ok {
+					repos = append(repos, m)
+				}
+			}
+		}
+	}
+
+	// Fallback: direct array
+	if len(repos) == 0 {
+		json.Unmarshal([]byte(raw), &repos)
+	}
+
+	return repos
+}
+
+func filterByLanguage(repos []map[string]interface{}, lang string) []map[string]interface{} {
+	langLower := strings.ToLower(lang)
+
+	// Build set of accepted languages
+	accepted := map[string]bool{langLower: true}
+	// JavaScript ecosystem includes TypeScript
+	if langLower == "javascript" {
+		accepted["typescript"] = true
+	}
+	if langLower == "typescript" {
+		accepted["javascript"] = true
+	}
+
+	filtered := make([]map[string]interface{}, 0)
+	for _, r := range repos {
+		repoLang := strings.ToLower(fmt.Sprintf("%v", r["language"]))
+		if accepted[repoLang] {
+			filtered = append(filtered, r)
+		}
+	}
+	// If filter removed everything, return unfiltered
+	if len(filtered) == 0 {
+		return repos
+	}
+	return filtered
+}
+
+func filterJunkRepos(repos []map[string]interface{}) []map[string]interface{} {
+	filtered := make([]map[string]interface{}, 0, len(repos))
+	for _, r := range repos {
+		name := strings.ToLower(fmt.Sprintf("%v", r["name"]))
+		desc := strings.ToLower(fmt.Sprintf("%v", r["description"]))
+
+		// Skip awesome-lists and curated collections
+		if strings.HasPrefix(name, "awesome") || strings.Contains(name, "awesome") {
+			continue
+		}
+		if strings.Contains(desc, "cheatsheet") || strings.Contains(desc, "curated list") ||
+			strings.Contains(desc, "collection of") || strings.Contains(desc, "list of") {
+			continue
+		}
+		if strings.Contains(desc, "tutorial") || strings.Contains(desc, "interview question") ||
+			strings.Contains(desc, "roadmap") || strings.Contains(name, "learn-") {
+			continue
+		}
+
+		// Category mismatch: testing tools
+		if strings.Contains(desc, "testing framework") || strings.Contains(desc, "test framework") ||
+			strings.Contains(desc, "test runner") || strings.Contains(desc, "end-to-end test") ||
+			strings.Contains(desc, "unit test") || strings.Contains(desc, "e2e test") ||
+			strings.Contains(desc, "testing tool") || strings.Contains(desc, "testing library") {
+			continue
+		}
+		// Category mismatch: CLI tools
+		if strings.Contains(desc, "command line") || strings.Contains(desc, "cli tool") ||
+			strings.Contains(desc, "command-line") {
+			continue
+		}
+		// Category mismatch: CMS / admin panels
+		if strings.Contains(desc, " cms ") || strings.Contains(desc, "content management") ||
+			strings.Contains(desc, "admin panel") || strings.Contains(desc, "admin interface") {
+			continue
+		}
+		// Category mismatch: boilerplate / starter
+		if strings.Contains(desc, "boilerplate") || strings.Contains(desc, "starter template") ||
+			strings.Contains(desc, "starter kit") || strings.Contains(name, "boilerplate") {
+			continue
+		}
+		// Category mismatch: bots, SDKs, chatbots
+		if strings.Contains(desc, "bot framework") || strings.Contains(desc, "chatbot") ||
+			strings.Contains(desc, "bot sdk") || strings.Contains(desc, "conversational") {
+			continue
+		}
+		// Category mismatch: desktop/mobile app platforms
+		if strings.Contains(desc, "desktop app") || strings.Contains(desc, "mobile app") ||
+			strings.Contains(desc, "app platform") {
+			continue
+		}
+		// Category mismatch: frontend / static-site / Jamstack (not backend)
+		if strings.Contains(desc, "static site") || strings.Contains(desc, "jamstack") ||
+			strings.Contains(desc, "static web") || strings.Contains(desc, "front-end") ||
+			strings.Contains(desc, "frontend framework") || strings.Contains(desc, "ui framework") ||
+			strings.Contains(desc, "vue-powered") || strings.Contains(desc, "react-powered") ||
+			strings.Contains(desc, "single page app") || strings.Contains(desc, "progressive web") ||
+			strings.Contains(desc, "static generator") || strings.Contains(desc, "site generator") {
+			continue
+		}
+
+		filtered = append(filtered, r)
+	}
+	return filtered
+}
+
+// stripNoiseWords removes common filler words from a query, keeping only
+// meaningful domain keywords. GitHub search works best with focused terms.
+func stripNoiseWords(query string) string {
+	noise := map[string]bool{
+		"find": true, "the": true, "top": true, "most": true,
+		"popular": true, "best": true, "on": true, "github": true,
+		"with": true, "stars": true, "list": true, "show": true,
+		"me": true, "get": true, "search": true, "for": true,
+		"all": true, "and": true, "their": true, "star": true,
+		"counts": true, "count": true, "explain": true, "why": true,
+		"each": true, "is": true, "are": true, "what": true,
+		"how": true, "a": true, "an": true, "of": true,
+		"in": true, "to": true, "by": true, "from": true,
+		// Structural qualifiers — these cause strict AND failures on GitHub
+		// because Express says "web framework" not "backend framework"
+		"backend": true, "frontend": true, "server": true, "client": true,
+		"side": true, "based": true, "powered": true,
+	}
+
+	words := strings.Fields(strings.ToLower(query))
+	kept := make([]string, 0)
+	for _, w := range words {
+		w = strings.Trim(w, ".,;:!?\"'()[]{}—-")
+		if len(w) < 2 {
+			continue
+		}
+		if noise[w] {
+			continue
+		}
+		// Skip pure numbers
+		isNum := true
+		for _, c := range w {
+			if c < '0' || c > '9' {
+				isNum = false
+				break
+			}
+		}
+		if isNum {
+			continue
+		}
+		kept = append(kept, w)
+	}
+
+	if len(kept) == 0 {
+		return strings.ToLower(query)
+	}
+	return strings.Join(kept, " ")
+}
+
+// simplifyRepoListWithLang filters results to match the requested language.
+func simplifyRepoListWithLang(raw string, requestedLang string) (string, error) {
+	if requestedLang == "" {
+		return simplifyRepoList(raw)
+	}
+
+	// Parse the raw response first
+	var repos []map[string]interface{}
+
+	var searchResult map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &searchResult); err == nil {
+		if items, ok := searchResult["items"].([]interface{}); ok {
+			for _, item := range items {
+				if m, ok := item.(map[string]interface{}); ok {
+					repos = append(repos, m)
+				}
+			}
+		}
+	}
+	if len(repos) == 0 {
+		if err := json.Unmarshal([]byte(raw), &repos); err != nil {
+			return raw, nil
+		}
+	}
+
+	// Hard filter: only keep repos that match the requested language
+	langLower := strings.ToLower(requestedLang)
+	filtered := make([]map[string]interface{}, 0)
+	for _, r := range repos {
+		repoLang := strings.ToLower(fmt.Sprintf("%v", r["language"]))
+		if repoLang == langLower || repoLang == "" {
+			filtered = append(filtered, r)
+		}
+	}
+
+	// Re-encode as array for simplifyRepoList
+	data, err := json.Marshal(filtered)
+	if err != nil {
+		return simplifyRepoList(raw)
+	}
+
+	return simplifyRepoList(string(data))
+}
+
+// detectLanguage extracts a programming language name from a natural language query.
+func detectLanguage(query string) string {
+	q := strings.ToLower(query)
+	languages := map[string]string{
+		"python":     "python",
+		"javascript": "javascript",
+		"typescript": "typescript",
+		"go":         "go",
+		"golang":     "go",
+		"rust":       "rust",
+		"java":       "java",
+		"ruby":       "ruby",
+		"c++":        "cpp",
+		"cpp":        "cpp",
+		"c#":         "csharp",
+		"csharp":     "csharp",
+		"php":        "php",
+		"swift":      "swift",
+		"kotlin":     "kotlin",
+		"scala":      "scala",
+		"elixir":     "elixir",
+	}
+	for keyword, lang := range languages {
+		if strings.Contains(q, keyword) {
+			return lang
+		}
+	}
+	return ""
+}
+
 func simplifyRepoList(raw string) (string, error) {
 	var repos []map[string]interface{}
-	if err := json.Unmarshal([]byte(raw), &repos); err != nil {
-		return raw, nil
+
+	// Search API returns {items: [...]} wrapper
+	var searchResult map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &searchResult); err == nil {
+		if items, ok := searchResult["items"].([]interface{}); ok {
+			for _, item := range items {
+				if m, ok := item.(map[string]interface{}); ok {
+					repos = append(repos, m)
+				}
+			}
+		}
+	}
+
+	// Fallback: direct array (user/repos endpoint)
+	if len(repos) == 0 {
+		if err := json.Unmarshal([]byte(raw), &repos); err != nil {
+			return raw, nil
+		}
+	}
+
+	// Filter junk repos — awesome-lists, collections, non-code repos
+	filtered := make([]map[string]interface{}, 0, len(repos))
+	for _, r := range repos {
+		name := strings.ToLower(fmt.Sprintf("%v", r["name"]))
+		desc := strings.ToLower(fmt.Sprintf("%v", r["description"]))
+		fullName := strings.ToLower(fmt.Sprintf("%v", r["full_name"]))
+
+		// Skip awesome-lists and curated collections
+		if strings.HasPrefix(name, "awesome") || strings.Contains(desc, "curated list") ||
+			strings.Contains(desc, "cheatsheet") || strings.Contains(desc, "collection of") ||
+			strings.Contains(desc, "list of") || strings.Contains(name, "awesome") {
+			continue
+		}
+
+		// Skip if it's clearly a learning resource, not a library/framework
+		if strings.Contains(desc, "tutorial") || strings.Contains(desc, "interview question") ||
+			strings.Contains(desc, "roadmap") || strings.Contains(name, "learn-") {
+			continue
+		}
+
+		_ = fullName
+		filtered = append(filtered, r)
+	}
+	repos = filtered
+
+	// Sort by stars descending (in case API didn't sort correctly)
+	for i := 1; i < len(repos); i++ {
+		for j := i; j > 0; j-- {
+			starsJ := toFloat(repos[j]["stargazers_count"])
+			starsJm1 := toFloat(repos[j-1]["stargazers_count"])
+			if starsJ > starsJm1 {
+				repos[j], repos[j-1] = repos[j-1], repos[j]
+			}
+		}
 	}
 
 	if len(repos) > maxListItems {
 		repos = repos[:maxListItems]
 	}
+
+	// Diversity guard: max 2 repos per owner to prevent clustering
+	ownerSeen := make(map[string]int)
+	diverse := make([]map[string]interface{}, 0, len(repos))
+	for _, r := range repos {
+		owner := ""
+		if fn, ok := r["full_name"].(string); ok {
+			parts := strings.SplitN(fn, "/", 2)
+			if len(parts) > 0 {
+				owner = strings.ToLower(parts[0])
+			}
+		}
+		ownerSeen[owner]++
+		if ownerSeen[owner] <= 2 {
+			diverse = append(diverse, r)
+		}
+	}
+	repos = diverse
 
 	simple := make([]map[string]interface{}, 0, len(repos))
 	for _, r := range repos {
@@ -283,6 +839,7 @@ func simplifyRepoList(raw string) (string, error) {
 			"description": r["description"],
 			"language":    r["language"],
 			"stars":       r["stargazers_count"],
+			"forks":       r["forks_count"],
 			"updated_at":  r["updated_at"],
 			"private":     r["private"],
 			"url":         r["html_url"],
@@ -291,6 +848,17 @@ func simplifyRepoList(raw string) (string, error) {
 
 	out, _ := json.Marshal(simple)
 	return string(out), nil
+}
+
+func toFloat(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	default:
+		return 0
+	}
 }
 
 func simplifyRepo(raw string) (string, error) {
@@ -330,6 +898,11 @@ func simplifyIssueList(raw string) (string, error) {
 
 	simple := make([]map[string]interface{}, 0, len(issues))
 	for _, i := range issues {
+		// Filter out pull requests — GitHub API returns PRs in issues endpoint
+		if _, isPR := i["pull_request"]; isPR {
+			continue
+		}
+
 		entry := map[string]interface{}{
 			"number":     i["number"],
 			"title":      i["title"],

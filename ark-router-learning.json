@@ -1,12 +1,5 @@
 [
   {
-    "key": "complete:strong",
-    "attempts": 3,
-    "successes": 3,
-    "failures": 0,
-    "success_rate": 1
-  },
-  {
     "key": ":fast",
     "attempts": 3,
     "successes": 3,
@@ -14,9 +7,23 @@
     "success_rate": 1
   },
   {
+    "key": "retry:strong",
+    "attempts": 1,
+    "successes": 1,
+    "failures": 0,
+    "success_rate": 1
+  },
+  {
     "key": "tool_call:fast",
-    "attempts": 3,
-    "successes": 3,
+    "attempts": 72,
+    "successes": 72,
+    "failures": 0,
+    "success_rate": 1
+  },
+  {
+    "key": "complete:strong",
+    "attempts": 67,
+    "successes": 67,
     "failures": 0,
     "success_rate": 1
   }

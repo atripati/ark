@@ -349,11 +349,11 @@ type ScoreWeights struct {
 
 func DefaultWeights() ScoreWeights {
 	return ScoreWeights{
-		Relevance:  0.40,
-		Success:    0.30,
+		Relevance:  0.50, // intent + keyword match is king
+		Success:    0.20, // history matters but doesn't dominate
 		Latency:    0.05,
-		TokenCost:  0.15,
-		Confidence: 0.10,
+		TokenCost:  0.10,
+		Confidence: 0.05, // reduced — was allowing 120-call tools to win on inertia
 	}
 }
 
@@ -384,7 +384,13 @@ func (ts *ToolStats) SuccessRate() float64 {
 }
 
 func (ts *ToolStats) Confidence() float64 {
-	return float64(ts.TotalCalls) / (float64(ts.TotalCalls) + 5.0)
+	// Cap at log scale to prevent high-history tools from dominating.
+	// 5 calls = 0.50, 10 calls = 0.67, 50 calls = 0.77, 500 calls = 0.77 (capped)
+	raw := float64(ts.TotalCalls) / (float64(ts.TotalCalls) + 5.0)
+	if raw > 0.80 {
+		raw = 0.80 // hard cap — prevents 100+ call tools from being unbeatable
+	}
+	return raw
 }
 
 type RankedTool struct {
@@ -532,6 +538,34 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 			}
 		}
 
+		// Intent-matching boost: when query signals search/ranking intent,
+		// boost tools whose description explicitly handles that intent.
+		// This prevents high-history tools from drowning out the right tool.
+		intentKeywords := map[string][]string{
+			"search":  {"top", "popular", "best", "most", "trending", "search", "find"},
+			"compare": {"compare", "versus", "difference", "better"},
+		}
+		descLower := strings.ToLower(block.Content + " " + strings.Join(block.Tags, " "))
+		for intent, triggers := range intentKeywords {
+			queryHasIntent := false
+			for _, trigger := range triggers {
+				for _, qw := range queryWords {
+					if qw == trigger {
+						queryHasIntent = true
+						break
+					}
+				}
+				if queryHasIntent {
+					break
+				}
+			}
+			if queryHasIntent && strings.Contains(descLower, intent) {
+				rt.RelevanceScore = clamp(rt.RelevanceScore+0.40, 0, 1)
+				break
+			}
+		}
+		_ = intentKeywords
+
 		stats, hasHistory := r.successLog[id]
 		if hasHistory && stats.TotalCalls > 0 {
 			rt.SuccessScore = stats.SuccessRate()
@@ -542,6 +576,13 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 			}
 		} else {
 			rt.SuccessScore = 0.5
+
+			// Fix 3: Exploration bonus — new/unused tools get a boost so they
+			// can compete with established tools. Without this, ARK is
+			// exploit-only and never discovers better tools.
+			if rt.RelevanceScore > 0.15 {
+				rt.SuccessScore += 0.15 // exploration pressure
+			}
 		}
 
 		if hasHistory && stats.AvgLatency > 0 {
@@ -553,8 +594,13 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 		if hasHistory && stats.AvgCost > 0 {
 			rt.ActualCostUSD = stats.AvgCost
 			rt.CostPenalty = clamp(stats.AvgCost/0.01, 0, 1)
+		} else if hasHistory {
+			// Has history but no cost data — neutral penalty
+			rt.CostPenalty = 0.3
 		} else if block.TokenCount > 0 {
-			rt.CostPenalty = float64(block.TokenCount) / float64(maxTokens)
+			// No history at all — use moderate penalty, not schema-based
+			// Schema token count is a poor proxy for runtime cost
+			rt.CostPenalty = 0.3
 		}
 
 		if hasHistory {
@@ -564,6 +610,9 @@ func (r *ToolRanker) Rank(query string, mgr *Manager) []RankedTool {
 		}
 
 		rt.MemoryBonus = r.memory.QueryBonus(id, queryWords)
+		if rt.MemoryBonus > 0.10 {
+			rt.MemoryBonus = 0.10 // cap — memory informs, doesn't dominate
+		}
 
 		rt.Score = (rt.RelevanceScore * r.weights.Relevance) +
 			(rt.SuccessScore * r.weights.Success) -

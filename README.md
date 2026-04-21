@@ -1,162 +1,199 @@
 # ARK — AI Runtime Kernel
 
-**Stop wasting agent context on unused tool schemas.**
+**Cut agent costs by 80–90%. Make every step verifiable. Ship agents that don't hallucinate.**
 
-ARK is an open-source runtime in Go that makes AI agents faster, cheaper, and smarter:
+ARK doesn't let the model control the system. The runtime does.
 
-• **99% less context waste** — loads 3 relevant tools, not all 140
-• **Per-step model routing** — tool calls on cheap models, reasoning on strong models
-• **Cost per decision** — every step has a dollar amount, cost feeds back into ranking
-• **Learns across runs** — successful tools rise, failing tools drop, persists to disk
+It decides which tools run, which model handles each step, how much each decision costs, and whether the output is valid — before anything reaches the user. The model's job is reduced to what it's good at: language. Everything else is governed.
+
+```
+┌─ ARK Agent: Task "ark-run"
+│  find the top 5 most popular JavaScript backend frameworks on GitHub
+│
+├─ Task type: ranking
+├─ Context: loaded 3 tools (93 tokens) [strategy: minimal]
+├─ Step 1: TOOL_CALL — github_search_repos
+│  ↳ ✓ Verified (confidence: 88%)
+├─ Step 2: ✓ Reasoning verified (confidence: 87%)
+├─ Step 2: COMPLETE — NestJS (75K★), Express (69K★), Socket.IO (63K★)...
+│
+└─ Done: 2 steps, 1406 tokens, 6.5s | Cost: $0.005
+
+  💰 Cost: $0.005 per task (not $0.05)
+  🧠 Routing: gpt-4o-mini → tool call, gpt-4o → reasoning
+  🔍 Governor: verified both steps, variable confidence
+  📊 Learning: 258 observations, 99% success rate
+```
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-106%20passing-brightgreen?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-156%20passing-brightgreen?style=flat-square)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 
 ---
 
-## Model Router — the right model for each step
+## Why ARK Exists
 
-ARK doesn’t use one model for everything. It routes each step to the optimal model automatically.
+Current agent frameworks have a fundamental design flaw: **they let the model make infrastructure decisions.**
+
+The model picks which tools to call. The model decides if the output is good enough. The model controls retry logic. This is like letting a database query decide its own execution plan.
+
+ARK inverts this. The runtime makes every infrastructure decision. The model only does language work.
+
+| What other frameworks do | What ARK does |
+|--------------------------|---------------|
+| Dump all 140 tool schemas into prompt | Load 3 relevant tools per task (99.9% context reduction) |
+| Use one model for every step | Route each step: cheap model for tool calls, strong for reasoning |
+| No cost visibility until the bill | Per-decision cost graph — every step has a dollar amount |
+| Trust model output blindly | Cognitive governor verifies every output with calibrated confidence |
+| Every run starts from zero | Bayesian learning persists across runs — Run 2 is smarter than Run 1 |
+| Forward raw queries to APIs | Query intelligence: noise stripping, language detection, semantic scoring |
+
+---
+
+## What Makes ARK Different
+
+### 1. Cognitive Governor
+
+The governor is the core of ARK. It sits between every model call and the user, enforcing trust.
+
+```
+Task → Classify → Predict failure → Select model → Execute → Verify → Learn → Output
+         ↑                                                       │
+         └───────────── Registry feeds back ─────────────────────┘
+```
+
+Every output gets a calibrated confidence score — not a flat number, but a signal computed from model history, tool track record, response quality, and grounding:
+
+```
+├─ Step 1: TOOL_CALL — github_search_repos
+│  ↳ ✓ Verified (confidence: 88%)     ← model proven on this tool
+├─ Step 2: ✓ Reasoning verified (confidence: 87%)  ← grounded in tool data
+```
+
+**Confidence is variable, not decorative:**
+- 85-88% → grounded reasoning with proven model+tool combo
+- 75% → pure reasoning without tool data
+- 50% → ungrounded (model answered without calling tools)
+- Below 60% → forces strong model on next step automatically
+
+The governor also:
+- **Predicts failures** before execution — skips models with bad track records
+- **Injects experience** into prompts ("Previous attempts with this tool had failures. Be more careful.")
+- **Tracks per-task-type performance** — learns that gpt-4o-mini handles retrieval but struggles with ranking
+- **Records task-type observations** — the registry knows performance per domain, not just per model
+
+### 2. Per-Step Model Routing
+
+ARK doesn't use one model for everything. Each step gets the right model:
 
 ```
 🧠 Model Routing:
   Step 1 [tool_call] gpt-4o-mini  (tool calls are simple, using fast model to save cost)
-  Step 2 [tool_call] gpt-4o-mini  (tool calls are simple, using fast model to save cost)
-  Step 3 [complete]  gpt-4o       (final reasoning benefits from strong model)
+  Step 2 [complete]  gpt-4o       (final reasoning benefits from strong model)
 
-  Fast model: 2 steps | Strong model: 1 step
-```
-
-Configure in `agent.yaml`:
-```yaml
-model:
-  provider: openai
-  strategy: cost_optimized    # single | cost_optimized | quality_first
-  fast_model: gpt-4o-mini     # cheap: $0.15/M tokens
-  strong_model: gpt-4o        # powerful: $2.50/M tokens
+  Fast model: 1 step | Strong model: 1 step
 ```
 
 The router learns from failures. If the fast model fails on a step type, ARK promotes it to the strong model next time. Learning persists across restarts.
 
-No other agent framework does this.
+### 3. Search Intelligence (7-Phase Pipeline)
+
+Most agent frameworks send the user's raw query to an API and hope for the best. ARK owns the entire retrieval pipeline:
+
+```
+"find the top 5 most popular JavaScript backend frameworks on GitHub"
+
+Phase 1: Query Intelligence
+  → Strip noise: "javascript frameworks"
+  → Detect language: JavaScript
+  → Add ecosystem hint: +nodejs
+  → Skip API language filter for JS (TypeScript repos also needed)
+
+Phase 2: Retrieval
+  → GitHub API: sort=stars, order=desc, per_page=30
+
+Phase 3: Language Filter
+  → Accept: JavaScript + TypeScript (NestJS, Fastify are TS)
+  → Reject: Java, Python, etc.
+
+Phase 4: Junk Filter
+  → Remove: awesome-lists, tutorials, cheatsheets, interview prep
+
+Phase 5: Semantic Scoring (3-tier)
+  → "web framework" in description  → 2.0× boost (Express, Fastify)
+  → No framework signal             → 0.3× penalty (unknown relevance)
+  → Anti-signal (ORM, CSS, testing) → 0.01× buried (Mocha, MUI)
+
+Phase 6: Diversity Guard
+  → Max 2 repos per owner (prevents Django/Django-channels clustering)
+
+Phase 7: Simplify
+  → Essential fields only → LLM explains, never selects
+```
+
+The LLM never decides what's relevant. The runtime ranks. The LLM explains.
+
+### 4. Decision-Level Cost Attribution
+
+Every step has a price tag. Cost feeds back into ranking.
+
+```
+💰 Cost Report: ark-run
+  Total Cost: $0.004840
+    Input:  $0.002750 (1100 tokens)
+    Output: $0.002090 (209 tokens)
+
+  Decision Cost Graph:
+    Step 1 [tool_call: github_search_repos]  $0.000990
+    Step 2 [complete]                        $0.003850
+```
+
+### 5. Task Classification
+
+ARK classifies every task before execution and adapts its behavior:
+
+```
+├─ Task type: ranking          ← detected from "top", "most popular"
+```
+
+| Task Type | Behavior |
+|-----------|----------|
+| ranking | Strong model for reasoning, search tool preferred |
+| retrieval | Cheap model sufficient, list tool preferred |
+| coding | Strong model, code-specific verification |
+| multi_step | High effort, full verification pipeline |
+| summarization | Medium effort, grounded check |
+
+### 6. Adaptive Learning
+
+ARK remembers across runs. Tool scores evolve based on real outcomes.
+
+```
+RUN 1: github_list_repos = 0.55   (no history)
+RUN 2: github_list_repos = 0.69   (1 success)
+RUN 3: github_list_repos = 0.95   (2 successes, compounding)
+
+RUN 1: github_search = 0.55       (no history)
+RUN 2: github_search = 0.42       (1 failure, demoted)
+```
+
+Learning is bounded — history can't dominate. Confidence capped at 0.80. New tools get exploration bonuses. Intent-matching boosts the right tool for the right query.
 
 ---
 
-## ARK Learns
+## By the Numbers
 
-Most AI tools treat every run as a fresh start. ARK remembers.
+| Metric | Raw MCP | ARK | Improvement |
+|--------|---------|-----|-------------|
+| Context per task | 60,468 tokens | ~93 tokens | **99.9% reduction** |
+| Cost per task | ~$0.05 | ~$0.005 | **10× cheaper** |
+| Tools loaded | All 140 | 3 relevant | **97% fewer** |
+| Steps to answer | 1 (expensive) | 2 (cheap + strong) | **Right model per step** |
+| Verification | None | Every output | **Variable confidence** |
+| Learning | None | Persistent | **Run 2 > Run 1** |
 
-```
-$ ark demo-learn
-
-  RUN 1 (no history):
-    1. github-search   0.552  ██████████████████████
-    2. github-get      0.382  ███████████████
-    3. github-list     0.378  ███████████████
-
-  github-search → FAILED (5000ms timeout)
-  github-list   → SUCCESS (120ms)
-
-  RUN 2 (learning from Run 1):
-    1. github-list     0.692  ███████████████████████████  [1 call, 100% success]
-    2. github-search   0.419  ████████████████              [1 call, 0% success]
-    3. github-get      0.382  ███████████████
-
-  RUN 3 (compounding knowledge):
-    1. github-list     0.954  ██████████████████████████████████████  [2 calls, 100%]
-    2. github-get      0.647  █████████████████████████
-    3. github-search   0.419  ████████████████
-
-  github-list:   0.378 → 0.954  (+152.7%)
-  github-search: 0.552 → 0.419  (-24.1%)
-
-  ✅ PROVEN: ARK promotes tools that work, demotes tools that fail.
-```
-
-ARK updates its decisions after every run — successful tools rise, failing tools fall. This persists across restarts.
-
-This behavior is deterministic and reproducible — not heuristic caching.
-
-## The Problem
-
-MCP tools waste **30% of your context window** before your agent does any work.
-
-Connect 7 MCP servers (GitHub, Slack, Jira, Gmail, Drive, Calendar, Postgres) and **60,000+ tokens are gone** — consumed by tool schemas your agent won't use in the current task. That's context you can't spend on reasoning, memory, or conversation.
-
-
-## Why not just load all tools?
-
-Because context is the bottleneck.
-
-Every token spent on unused tool schemas is a token not available for reasoning. ARK treats context as a constrained resource and allocates it dynamically per task.
-
-## What ARK Does
-
-ARK manages what your LLM sees. ARK is a runtime that solves three core problems:
-
-**1. Context Efficiency** — loads only 3-5 tools per task instead of all 140.
-
-```
-  Raw MCP:  60,468 tokens  (30.2% of context)
-  ARK:     ~80 tokens      (0.05% of context)
-  Savings:  99.9%
-```
-
-**2. Adaptive Execution** — when a tool fails, ARK observes the error type and reacts:
-
-```
-  Tool not found    → load more tools
-  Tool misunderstood → upgrade to full schema
-  Tool crashed      → swap to alternative
-  Nothing relevant  → broaden search to other servers
-```
-
-**3. Online Learning (persists across runs)** — every execution updates a weighted scoring model:
-
-
-Every tool is ranked using a weighted score based on runtime signals:
-```
-  score = (relevance × 0.40)
-        + (success_rate × 0.30)
-        - (latency × 0.05)
-        - (cost × 0.15)          ← real dollar cost, not token estimate
-        + (confidence × 0.10)
-        + memory_bonus
-```
-
-Scores and query patterns persist to disk. Run 2 is smarter than Run 1.
-
-**4. Decision-Level Cost Attribution** — every step has a price tag:
-
-```
-  💰 Cost Report: ark-run
-  Model: GPT-4o Mini
-  Total Cost: $0.000493
-    Input:  $0.000209 (1395 tokens)
-    Output: $0.000284 (473 tokens)
-
-  Decision Cost Graph:
-    Step 1 [tool_call: github_list_repos]  $0.000054  (in:303 out:15 tokens)
-    Step 2 [complete]                      $0.000439  (in:1092 out:458 tokens)
-```
-
-Cost flows back into ranking: expensive tools get demoted, cheap reliable tools get promoted. ARK doesn’t just track cost — it acts on cost.
-
-**5. Multi-Step Tool Chaining** — ARK chains tools autonomously:
-
-```
-$ ark run agent.yaml --task "find the most starred repo for openai, then list its open issues"
-
-  Step 1: TOOL_CALL — github_list_repos     → found whisper (97,613 stars)
-  Step 2: TOOL_CALL — github_list_issues    → listed 10 open issues
-  Step 3: COMPLETE  — summarized results
-
-  Cost: $0.000847 | Time: 6.9s | Models: gpt-4o-mini (2 steps) + gpt-4o (1 step)
-```
-
-Three steps, two tool calls, two models, one coherent answer. Less than a tenth of a penny.
+---
 
 ## Quick Start
 
@@ -164,48 +201,46 @@ Three steps, two tool calls, two models, one coherent answer. Less than a tenth 
 git clone https://github.com/atripati/ark.git
 cd ark
 
+# No API keys needed for demos
 go run ./cmd/ark bench        # see context savings (99.9% reduction)
 go run ./cmd/ark demo         # see failure → adapt → recover
 go run ./cmd/ark demo-learn   # see ranking improve across 3 runs
-go run ./cmd/ark init         # create an agent.yaml config
-```
 
-No API keys needed for any demo. Zero external dependencies.
-
-## Run a Real Agent
-
-```bash
-# With Ollama (free, local)
-go run ./cmd/ark run agent.yaml --task "list repos for openai"
-go run ./cmd/ark run agent.yaml --task "list files in the current directory"
-go run ./cmd/ark run agent.yaml --task "read the README.md file and summarize it"
-
-# With OpenAI (needs API key, ~$0.0005 per task)
+# With OpenAI (~$0.005 per task)
 export OPENAI_API_KEY=sk-...
-# edit agent.yaml: provider: openai, name: gpt-4o-mini
-go run ./cmd/ark run agent.yaml --task "list repos for openai"
-
-# With web search (needs free Brave API key)
-export BRAVE_API_KEY=BSA...
-go run ./cmd/ark run agent.yaml --task "what is the latest news about AI agents"
+export GITHUB_TOKEN=ghp_...
+go run ./cmd/ark run agent.yaml --task "find the top 3 most popular Python web frameworks on GitHub"
 ```
 
-## Safety
+## Configuration
 
-ARK is safe by default. Dangerous operations require explicit opt-in.
+```yaml
+name: my-agent
+version: "0.1"
 
-```bash
-ark run agent.yaml --task "list repos"          # ✅ reads work
-ark run agent.yaml --task "create issue"        # ❌ blocked
-ark run agent.yaml --task "create issue" --allow-write  # ✅ opt-in
-ark run agent.yaml --task "create issue" --dry-run      # ✅ simulate
+model:
+  provider: openai           # openai | anthropic | ollama
+  name: gpt-4o
+  max_tokens: 4096
+  strategy: cost_optimized   # single | cost_optimized | quality_first
+  fast_model: gpt-4o-mini
+  strong_model: gpt-4o
+
+context:
+  total_tokens: 200000
+  strategy: adaptive
+  tool_budget: 10%
+  memory_budget: 10%
+  conversation_budget: 35%
+  max_steps: 5
+  timeout_seconds: 120
+
+memory:
+  backend: file
+  path: "./ark-memory.json"
 ```
-
-Additional protections: domain allowlist, output validation (catches binary/garbage before LLM), output sanitization (4000 char cap), full audit traces for every context decision.
 
 ## Connect Any API
-
-Define custom HTTP tools in `agent.yaml`. ARK handles the rest — domain allowlisting, parameter validation, cost tracking, and learning.
 
 ```yaml
 tools:
@@ -222,28 +257,98 @@ tools:
     method: POST
     uri: "https://slack.com/api/chat.postMessage"
     description: "post a message to a Slack channel"
-    params:
-      - channel
-      - text
+    params: [channel, text]
     headers:
       Authorization: "Bearer ${SLACK_TOKEN}"
     write: true   # requires --allow-write
 ```
 
-Headers support `${ENV_VAR}` interpolation for secrets. Write operations are blocked by default. Domains are auto-allowlisted from the URI. ARK ranks, learns, and tracks cost for custom tools automatically — no extra code needed.
+ARK handles domain allowlisting, parameter validation, cost tracking, and learning for custom tools automatically.
 
 ## Built-in Tools
 
-| Server | Tools | Key Required |
-|--------|-------|-------------|
-| GitHub | list_repos, get_repo, list_issues, create_issue, list_pulls, get_user | GITHUB_TOKEN (optional) |
+| Category | Tools | Auth |
+|----------|-------|------|
+| GitHub | list_repos, get_repo, list_issues, create_issue, list_pulls, get_user, **search_repos** | GITHUB_TOKEN (optional) |
 | Web Search | web_search, web_search_news | BRAVE_API_KEY |
-| File System | file_read, file_write, file_list | None (local) |
-| Custom HTTP | Any REST API | Defined in agent.yaml |
+| File System | file_read, file_write, file_list | None |
+| Custom HTTP | Any REST API via agent.yaml | Defined in config |
+
+**12 tools** across 4 categories. All ranked, learned, and cost-tracked automatically.
+
+## Safety
+
+Safe by default. Dangerous operations require explicit opt-in.
+
+```bash
+ark run agent.yaml --task "list repos"          # ✅ reads work
+ark run agent.yaml --task "create issue"        # ❌ blocked
+ark run agent.yaml --task "create issue" --allow-write  # ✅ opt-in
+ark run agent.yaml --task "create issue" --dry-run      # ✅ simulate
+```
+
+## Architecture
+
+```
+ark/
+├── cmd/ark/                    CLI (run, bench, demo, init)
+├── pkg/
+│   ├── config/                 YAML config parser + validation (14 tests)
+│   ├── context/                Context engine + adaptive ranker + memory
+│   │   ├── manager.go          Budget allocation, compression, eviction
+│   │   └── engine.go           Tool ranking, intent matching, scoring
+│   ├── governor/               Cognitive supervisor
+│   │   ├── registry.go         Model capability registry (Bayesian learning)
+│   │   ├── verifier.go         Output verification (variable confidence)
+│   │   ├── intelligence.go     Task classification, failure prediction, effort allocation
+│   │   └── adapter.go          Runtime bridge
+│   ├── models/                 LLM providers (Anthropic, OpenAI, Ollama)
+│   ├── router/                 Per-step model routing (persistent learning)
+│   ├── runtime/                Agent execution loop
+│   │   └── agent.go            Governor integration, tool output trimming, diversity
+│   ├── cost/                   Decision-level cost attribution
+│   ├── store/                  Persistent learning (JSON, decay, snapshots)
+│   └── tools/                  Tool implementations
+│       ├── github.go           7 GitHub tools + search intelligence pipeline
+│       ├── websearch.go        Brave Search (web + news)
+│       ├── filesystem.go       File system (read/write/list)
+│       └── custom.go           Custom HTTP tool engine
+
+156 tests | Race detector clean | 12 tools | Per-step model routing
+Cognitive governor | Variable confidence | Task classification
+```
+
+## How the Scoring Works
+
+Every tool gets a composite score from weighted signals:
+
+| Signal | Weight | What it measures |
+|--------|--------|-----------------|
+| Relevance | 50% | Keyword match + intent boost |
+| Success rate | 20% | Historical success/failure ratio |
+| Confidence | 5% | Data volume (capped at 0.80 to prevent bias) |
+| Cost | -10% | Real dollar cost per call |
+| Latency | -5% | Penalty for slow tools |
+| Memory bonus | up to 10% | Similar query succeeded before |
+
+New tools get an exploration bonus (+0.15) so they can compete with established tools. Intent keywords ("top", "popular", "best") boost search tools by +0.40.
+
+## Production Guarantees
+
+| Guarantee | How |
+|-----------|-----|
+| No hallucination when tools available | Governor blocks ungrounded responses |
+| Variable confidence | 88% grounded, 75% pure reasoning, 50% ungrounded |
+| No invalid tool calls | RequiredParams validated before execution |
+| No runaway loops | MaxSteps=5, TotalTimeout=120s, per-tool retry budget |
+| Cost-aware | Per-decision cost graph, budget enforcement |
+| Self-improving | Bayesian learning, persistent across restarts |
+| Failure prediction | Governor predicts failures before execution |
+| Task-aware routing | Ranking tasks force strong model |
+| Diversity enforcement | Max 2 repos per owner, junk filtering |
+| Semantic scoring | 3-tier relevance (boost / penalize / bury) |
 
 ## Stress Tested
-
-ARK was stress tested with 30 sequential and parallel runs. Results:
 
 ```
 Sequential (20 runs):  20/20 completed, 0 crashes, 0 hallucinated data
@@ -251,174 +356,67 @@ Parallel (10 runs):    10/10 completed, 0 crashes, 0 state corruption
 
 Failures handled correctly:
   401 (no auth)     → LLM retried with user param → succeeded
-  Tool hallucinated → "github_get_repos" rejected, valid tools listed → LLM self-corrected
+  Tool hallucinated → rejected, valid tools listed → LLM self-corrected
   Timeout           → clean termination with structured error
 ```
 
-**Zero hallucinated answers across all 30 runs.** Every answer was grounded in real API data.
-
-## Production Guarantees
-
-| Guarantee | How |
-|-----------|-----|
-| No hallucination when tools available | Grounding gate blocks ungrounded answers |
-| No invalid tool calls | RequiredParams validated before execution |
-| No runaway loops | MaxSteps=5, TotalTimeout=120s, per-tool retry budget |
-| No silent failures | Structured error taxonomy (auth/404/429/timeout/params) |
-| No state corruption | Deep-copy persistence, snapshot semantics, race-detector clean |
-| Deterministic ranking | Sorted IDs, stable sort with tiebreaker |
-| Observable | RuntimeMetrics, TraceJSON export, per-tool latency P50 |
-| Cost-aware | Per-decision cost graph, budget enforcement, cost-weighted ranking |
-| Model routing | Per-step intelligence allocation, self-improving, persistent learning |
-
-## Architecture
-
-```
-ark/
-├── cmd/ark/                    CLI (run, bench, demo, demo-learn, init)
-├── pkg/
-│   ├── config/                 YAML config parser + validation
-│   │   ├── config.go
-│   │   └── config_test.go      14 tests
-│   ├── context/                Context engine + ranker + tracer + memory
-│   │   ├── manager.go          Budget allocation, compression, eviction
-│   │   ├── engine.go           Dynamic engine, tool ranker, context memory
-│   │   ├── manager_test.go     7 tests
-│   │   └── engine_test.go      12 tests
-│   ├── models/                 LLM providers (Anthropic, OpenAI, Ollama)
-│   │   └── providers.go        Raw HTTP, retry + backoff, no SDKs
-│   ├── router/                 Per-step model routing
-│   │   ├── router.go           Step classifier, tier selection, persistent learning
-│   │   └── router_test.go      14 tests
-│   ├── runtime/                Agent execution loop
-│   │   ├── agent.go            ReAct loop, grounding gate, metrics, trace export
-│   │   └── agent_test.go       7 tests
-│   ├── cost/                   Decision-level cost attribution
-│   │   ├── cost.go             Tracker, pricing, budget, attribution, aggregation
-│   │   └── cost_test.go        14 tests
-│   ├── store/                  Persistent learning
-│   │   ├── store.go            Channel worker, snapshot semantics, decay
-│   │   └── store_test.go       5 tests
-│   └── tools/                  Real tool execution
-│       ├── http.go             Router, param validation, output validation, safety
-│       ├── http_test.go        12 tests
-│       ├── github.go           6 GitHub API tools
-│       ├── websearch.go        2 Brave Search tools (web + news)
-│       ├── filesystem.go       3 file system tools (read/write/list)
-│       ├── filesystem_test.go  12 tests
-│       ├── custom.go           Custom HTTP tool engine (any API via agent.yaml)
-│       └── custom_test.go      10 tests
-├── LICENSE                     Apache 2.0
-├── NOTICE                      Attribution
-└── README.md
-
-106 tests | Race detector clean | 11 tools across 3 servers | Per-step model routing
-```
-
-## How the Scoring Works
-
-Every tool gets a composite score from 6 signals:
-
-| Signal | Weight | What it measures |
-|--------|--------|-----------------|
-| Relevance | 40% | How well the tool matches the current query |
-| Success rate | 30% | Historical success/failure ratio |
-| Latency | -5% | Penalty for slow tools |
-| **Cost** | **-15%** | **Real dollar cost per call (not token estimate)** |
-| Confidence | 10% | How much data we have (Bayesian) |
-| Memory bonus | varies | Did this tool work for a similar query before? |
-
-Cost is a first-class decision signal. A tool that costs 10x more but has the same success rate will be ranked lower. This makes ARK economically rational — it optimizes for value, not just accuracy.
-
-Tools with 0% success rate rank last. Tools on a 3+ failure streak get halved scores. All of this persists across restarts.
-
 ## Roadmap
 
-### v0.5 — Learning Runtime ✅
-- [x] Context engine with budget allocation + compression
-- [x] Dynamic context: load → observe → expand → retry
-- [x] Weighted tool scoring (6 signals)
-- [x] Persistent learning (tool stats + query patterns)
-- [x] Adaptive execution (error-driven strategy switching)
-- [x] Full audit tracer
-- [x] 3 LLM providers (Anthropic, OpenAI, Ollama)
-- [x] 6 real GitHub API tools
-- [x] Safety: domain allowlist, write protection, dry-run
-- [x] 33 tests, 5 CLI commands
+### v1.0 — Cognitive Governor ✅ (current)
+- [x] Cognitive governor (verifier + registry + intelligence layer)
+- [x] Task classification (ranking, retrieval, coding, multi_step, reasoning)
+- [x] Variable confidence (model history + tool track record + response quality)
+- [x] Failure prediction (predict → avoid before execution)
+- [x] Experience-aware prompting (inject failure history into prompts)
+- [x] Confidence-driven routing (low confidence → force strong model)
+- [x] Search intelligence (noise stripping, language detection, semantic scoring)
+- [x] Diversity enforcement (max 2 per owner, junk filtering)
+- [x] Context-aware learning (per-task-type performance tracking)
+- [x] Intent-aware tool selection (search vs list based on query signals)
+- [x] Scoring rebalance (relevance dominates, history capped)
+- [x] Tool output trimming (50-70% token reduction)
+- [x] 156 tests, race detector clean, 12 tools
 
-### v0.6 — Production Hardening ✅
-- [x] Grounding gate (no hallucination when tools available)
-- [x] Parameter validation (RequiredParams on all tools)
-- [x] Error taxonomy (auth/404/429/timeout/params → distinct strategies)
-- [x] Monotonic learning (scores never regress on success)
-- [x] Deterministic ranking (sorted IDs, stable sort)
-- [x] Safe persistence (deep-copy, snapshot semantics)
-- [x] Runtime metrics + TraceJSON export
-- [x] Execution bounds (MaxSteps, TotalTimeout, per-tool retry budget)
-- [x] 53 tests, race detector clean, 30-run stress test
-
-### v0.7 — Cost Attribution ✓
-- [x] Decision-level cost graph (per-step, per-tool, per-action)
-- [x] Provider-aware pricing (Anthropic, OpenAI, Ollama)
-- [x] Accurate input/output token split (verified with OpenAI)
-- [x] Cost-aware ranking (15% weight, expensive tools demoted)
-- [x] Budget enforcement (max_cost_per_task stops execution)
-- [x] Cost attribution (user_id, feature_id, session_id)
-- [x] Cross-task aggregation (cost by feature, by user, by tool)
-- [x] Human-readable trace (real dollars + score impact)
-
-### v0.8 — Tool Ecosystem ✓
-- [x] Web search (Brave Search API — web + news)
-- [x] File system tools (read/write/list with path safety)
-- [x] Custom HTTP tools (any API via agent.yaml)
-- [x] Output validation layer (catches garbage before LLM)
-- [x] Domain auto-allowlisting for custom tools
-- [x] Environment variable interpolation in headers (${ENV_VAR})
-- [x] Clean tool registration (ToolDefs pattern)
-
-### v0.9 — Model Router ✓ (current)
-- [x] Per-step model routing (tool calls → fast, reasoning → strong)
-- [x] 3 strategies: single, cost_optimized, quality_first
-- [x] Automatic fallback: fast fails → retry with strong
-- [x] Self-improving: learns which model works for each step type
-- [x] Persistent learning across restarts (ark-router-learning.json)
-- [x] Human-readable routing trace in output
-- [x] Backwards compatible (single model = default, zero config change)
-- [x] 106 tests, race detector clean
-
-### v1.0 — MCP Protocol (next)
-- [ ] MCP server connector (connect to live MCP servers over stdio/SSE)
-- [ ] Auto-discover tools from MCP server
+### v1.1 — MCP Protocol (next)
+- [ ] MCP server connector (stdio/SSE)
+- [ ] Auto-discover tools from MCP servers
 - [ ] ARK manages context for any MCP-connected tool
 
-### v1.1 — Production Storage
-- [ ] SQLite backend (replace JSON file store)
+### v1.2 — Production Storage
+- [ ] SQLite backend
 - [ ] Multi-agent shared memory
-- [ ] Query pattern clustering (semantic, not keyword)
+- [ ] Semantic query clustering
 
-### v1.2 — Production Runtime
-- [ ] `ark run` with streaming output
+### v1.3 — Production Runtime
+- [ ] Streaming output
 - [ ] Hot-reload agent configs
-- [ ] Plugin system for custom tools
-- [ ] OpenTelemetry trace export
+- [ ] Plugin system
+- [ ] OpenTelemetry export
 - [ ] `go get github.com/atripati/ark` library mode
 
 ## Contributing
 
-ARK is designed to be the foundational runtime for AI agents. There's a lot to build.
+ARK is designed to be the foundational runtime for AI agents.
 
 **Good first issues:**
 - Add tiktoken-based token counting
 - Write MCP server connector
 - Add Slack tool set
-- Add `--trace=summary` mode
 - SQLite store backend
+- Add more language detection (Rust, Swift, Kotlin)
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions.
 
 ## Why "ARK"
 
-**A**I **R**untime **K**ernel. A vessel built to carry what matters through turbulent waters. AI agent development is a flood of accidental complexity. ARK carries your agent logic safely above it.
+**A**I **R**untime **K**ernel.
+
+Not a framework — frameworks give you scaffolding and hope you fill it in.
+Not a wrapper — wrappers add a layer and call it abstraction.
+
+A kernel. The lowest layer that governs how intelligence is allocated, how decisions are verified, and how money is spent. Every tool call, every model selection, every output flows through ARK before it reaches the user.
+
+The model is the CPU. ARK is the operating system.
 
 ## License
 

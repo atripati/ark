@@ -117,8 +117,8 @@ func (m *Manager) RegisterTool(id, name, description string, fullSchema string) 
 		TokenCount:       EstimateTokens(fullSchema),
 		Priority:         0.5, // Default priority, adjusted by usage
 		LastUsed:         time.Now(),
-		Compressed:       compressToolSchema(name, description),
-		CompressedTokens: EstimateTokens(compressToolSchema(name, description)),
+		Compressed:       compressToolSchemaWithParams(name, description, fullSchema),
+		CompressedTokens: EstimateTokens(compressToolSchemaWithParams(name, description, fullSchema)),
 		Tags:             extractTags(name, description),
 	}
 	m.Register(block)
@@ -525,6 +525,39 @@ func compressToolSchema(name, description string) string {
 		desc = desc[:100] + "..."
 	}
 	return fmt.Sprintf("Tool: %s — %s", name, desc)
+}
+
+// compressToolSchemaWithParams includes param names so the LLM knows what to pass.
+// This prevents "missing required params" errors on first call.
+func compressToolSchemaWithParams(name, description, fullSchema string) string {
+	desc := description
+	if idx := strings.Index(desc, ". "); idx > 0 && idx < 100 {
+		desc = desc[:idx+1]
+	} else if len(desc) > 100 {
+		desc = desc[:100] + "..."
+	}
+
+	// Extract params from the full schema JSON
+	params := extractParamsFromSchema(fullSchema)
+	if params != "" {
+		return fmt.Sprintf("Tool: %s — %s Params: %s", name, desc, params)
+	}
+	return fmt.Sprintf("Tool: %s — %s", name, desc)
+}
+
+func extractParamsFromSchema(schema string) string {
+	// Quick extraction: find "params":["x","y"] in schema JSON
+	idx := strings.Index(schema, `"params"`)
+	if idx < 0 {
+		return ""
+	}
+	rest := schema[idx:]
+	start := strings.Index(rest, "[")
+	end := strings.Index(rest, "]")
+	if start >= 0 && end > start {
+		return rest[start : end+1]
+	}
+	return ""
 }
 func extractTags(parts ...string) []string {
 	stopWords := map[string]bool{

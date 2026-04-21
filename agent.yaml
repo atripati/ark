@@ -6,9 +6,12 @@ version: "0.1"
 
 # Model configuration (swap providers with a single line change)
 model:
-  provider: ollama
-  name: llama3
+  provider: openai
+  name: gpt-4o
   max_tokens: 4096
+  strategy: cost_optimized
+  fast_model: gpt-4o-mini
+  strong_model: gpt-4o
     
   
 
@@ -17,6 +20,7 @@ model:
 # ARK dynamically loads only what's relevant.
 context:
   total_tokens: 200000
+  strategy: adaptive
   tool_budget: 10%    # vs 30-50% with raw MCP
   memory_budget: 10%
   conversation_budget: 35%
@@ -59,7 +63,7 @@ tools:
 memory:
   backend: file  # file | memory (sqlite coming soon)
   shared: false    # Enable shared memory graph for multi-agent
-  path: "./ark-memory.db"
+  path: "./ark-memory.json"
 
 # Observability (built-in, always on)
 tracing:

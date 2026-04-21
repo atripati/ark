@@ -1,0 +1,74 @@
+{
+  "gpt-4o": {
+    "model_name": "gpt-4o",
+    "total_calls": 266,
+    "total_success": 264,
+    "total_failure": 2,
+    "success_rate": 0.9924812030075187,
+    "tool_call_score": 1,
+    "reasoning_score": 1,
+    "coding_score": 0.5,
+    "follow_score": 1,
+    "avg_latency_ms": 2473.7565041532184,
+    "avg_cost": 0,
+    "hallucination_count": 0,
+    "hallucination_rate": 0,
+    "tool_records": {
+      "github_list_issues": {
+        "calls": 8,
+        "successes": 7,
+        "failures": 1,
+        "success_rate": 0.875,
+        "avg_latency_ms": 1859.1069999999997,
+        "last_failure": "2026-04-18T17:47:14.624909-05:00",
+        "last_success": "2026-04-18T17:47:14.624864-05:00"
+      },
+      "github_list_repos": {
+        "calls": 16,
+        "successes": 16,
+        "failures": 0,
+        "success_rate": 1,
+        "avg_latency_ms": 1734.5805615999998,
+        "last_failure": "0001-01-01T00:00:00Z",
+        "last_success": "2026-04-19T07:57:49.720226-05:00"
+      },
+      "github_search_repos": {
+        "calls": 122,
+        "successes": 121,
+        "failures": 1,
+        "success_rate": 0.9918032786885246,
+        "avg_latency_ms": 981.9129217817914,
+        "last_failure": "2026-04-19T09:23:54.11891-05:00",
+        "last_success": "2026-04-20T09:20:45.168625-05:00"
+      }
+    },
+    "step_records": {
+      "coding": {
+        "calls": 2,
+        "successes": 2,
+        "failures": 0,
+        "success_rate": 1
+      },
+      "complete": {
+        "calls": 72,
+        "successes": 72,
+        "failures": 0,
+        "success_rate": 1
+      },
+      "ranking": {
+        "calls": 103,
+        "successes": 102,
+        "failures": 1,
+        "success_rate": 0.9902912621359223
+      },
+      "tool_call": {
+        "calls": 89,
+        "successes": 88,
+        "failures": 1,
+        "success_rate": 0.9887640449438202
+      }
+    },
+    "failure_patterns": {},
+    "last_updated": "2026-04-20T09:20:47.878971-05:00"
+  }
+}

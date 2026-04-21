@@ -44,12 +44,99 @@ func classifyAgentStep(step int, isRetry bool, prevAction string) string {
 	if isRetry {
 		return "retry"
 	}
+	// If previous step was a tool call, this step is reasoning/completion.
+	// The model now has data and needs to think — use strong model.
 	if prevAction == "tool_call" {
-		if step >= 3 {
-			return "complete"
-		}
+		return "complete"
 	}
 	return "tool_call"
+}
+
+// classifyTaskType determines the cognitive type of the incoming task.
+// This drives effort allocation, model selection, and confidence calibration.
+func classifyTaskType(task string) string {
+	t := strings.ToLower(task)
+
+	// Multi-step detection (check first)
+	multiSignals := []string{"and then", "after that", "step by step", "first", "finally"}
+	multiCount := 0
+	for _, sig := range multiSignals {
+		if strings.Contains(t, sig) {
+			multiCount++
+		}
+	}
+	if multiCount >= 2 || strings.Count(t, ",") >= 3 {
+		return "multi_step"
+	}
+
+	// Ranking/comparison — check BEFORE coding (needs strong model)
+	for _, sig := range []string{"top", "best", "most popular", "rank", "compare", "versus", "which is better"} {
+		if strings.Contains(t, sig) {
+			return "ranking"
+		}
+	}
+
+	// Coding — use word boundary awareness to avoid false positives
+	codingSignals := []string{"write code", "function", "implement", "debug", "fix the bug", "write a script", "refactor", "algorithm"}
+	for _, sig := range codingSignals {
+		if strings.Contains(t, sig) {
+			return "coding"
+		}
+	}
+
+	// Summarization
+	for _, sig := range []string{"summarize", "summary", "tldr", "overview", "key points", "recap"} {
+		if strings.Contains(t, sig) {
+			return "summarization"
+		}
+	}
+
+	// Reasoning
+	for _, sig := range []string{"why", "explain", "analyze", "evaluate", "should i", "pros and cons"} {
+		if strings.Contains(t, sig) {
+			return "reasoning"
+		}
+	}
+
+	// Retrieval
+	for _, sig := range []string{"find", "search", "list", "get", "show me", "look up", "fetch", "what is"} {
+		if strings.Contains(t, sig) {
+			return "retrieval"
+		}
+	}
+
+	return "general"
+}
+
+// Governor holds the verifier and registry — the "Teacher" layer.
+type Governor struct {
+	Registry GovernorRegistry
+	Verifier GovernorVerifier
+}
+
+// GovernorRegistry is the interface the agent uses to record model observations.
+type GovernorRegistry interface {
+	Record(model string, kind string, stepType string, toolName string, latencyMs float64, cost float64, errorClass string)
+	ShouldDemote(model string, toolName string) bool
+	FormatReport() string
+	PredictFailure(model string, taskType string, toolName string) (shouldAvoid bool, risk float64, reason string)
+	BuildExperienceContext(model string, toolName string) string
+}
+
+// GovernorVerifier is the interface the agent uses to verify outputs.
+type GovernorVerifier interface {
+	VerifyToolCall(model string, toolName string, call *ToolCall, response *ModelResponse) GovernorVerdict
+	VerifyReasoning(model string, response *ModelResponse, toolsAvailable bool, toolsCalled bool) GovernorVerdict
+	ShouldEscalate(taskID string, passed bool) bool
+	ResetEscalations(taskID string)
+}
+
+// GovernorVerdict is the simplified verdict the agent sees.
+type GovernorVerdict struct {
+	Passed     bool
+	Reason     string
+	Confidence float64
+	Flags      []string
 }
 
 type Agent struct {
@@ -57,6 +144,7 @@ type Agent struct {
 	executor Executor
 	tools    ToolHandler
 	config   AgentConfig
+	governor *Governor
 	Metrics  *RuntimeMetrics
 }
 
@@ -86,6 +174,18 @@ func NewAgent(engine *ctx.Engine, executor Executor, tools ToolHandler, config A
 		executor: executor,
 		tools:    tools,
 		config:   config,
+		Metrics:  NewRuntimeMetrics(),
+	}
+}
+
+// NewAgentWithGovernor creates an agent with the cognitive governor enabled.
+func NewAgentWithGovernor(engine *ctx.Engine, executor Executor, tools ToolHandler, config AgentConfig, gov *Governor) *Agent {
+	return &Agent{
+		engine:   engine,
+		executor: executor,
+		tools:    tools,
+		config:   config,
+		governor: gov,
 		Metrics:  NewRuntimeMetrics(),
 	}
 }
@@ -259,13 +359,27 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 	plan := a.engine.PrepareContext(taskID, task)
 	result.TraceID = plan.TraceID
 
+	// ── Task Classification ──
+	taskType := classifyTaskType(task)
 	if a.config.Verbose {
+		fmt.Printf("├─ Task type: %s\n", taskType)
 		fmt.Printf("├─ Context: loaded %d tools (%d tokens) [strategy: %s]\n",
 			len(plan.ToolsLoaded), plan.TokensUsed, plan.Strategy)
 	}
 
 	toolContext := a.engine.Manager().Render()
 	systemPrompt := buildSystemPrompt(toolContext, plan.ToolsLoaded)
+
+	// ── Governor: Inject experience context into system prompt ──
+	if a.governor != nil && a.governor.Registry != nil {
+		experienceHints := a.governor.Registry.BuildExperienceContext(a.config.Model, "")
+		if experienceHints != "" {
+			systemPrompt += experienceHints
+			if a.config.Verbose {
+				fmt.Printf("├─ Governor: injected experience hints into prompt\n")
+			}
+		}
+	}
 
 	var history []message
 	history = append(history, message{Role: "user", Content: task})
@@ -274,6 +388,7 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 	toolCallSucceeded := false
 	toolRetries := make(map[string]int)
 	deadline := time.Now().Add(a.config.TotalTimeout)
+	lastConfidence := 1.0 // tracks verification confidence across steps
 
 	for step := 0; step < a.config.MaxSteps; step++ {
 		if time.Now().After(deadline) {
@@ -301,18 +416,64 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 
 		stepStart := time.Now()
 
+		// ── Governor: Failure prediction BEFORE execution ──
+		if a.governor != nil && a.governor.Registry != nil {
+			shouldAvoid, risk, reason := a.governor.Registry.PredictFailure(a.config.Model, "tool_call", "")
+			if shouldAvoid {
+				if a.config.Verbose {
+					fmt.Printf("├─ Step %d: ⚠ PREDICTED FAILURE (risk=%.0f%%): %s\n", step+1, risk*100, reason)
+				}
+				// Force strong model for this step
+				if sa, ok := a.executor.(StepAwareExecutor); ok {
+					sa.SetStep(step+1, "retry") // "retry" forces strong model in the router
+					if a.config.Verbose {
+						fmt.Printf("│  ↳ Forcing strong model due to prediction\n")
+					}
+				}
+			}
+		}
+
+		// ── Governor: Confidence-driven routing (Fix 2) ──
+		if lastConfidence < 0.4 && a.governor != nil {
+			// Very low confidence → force strong model immediately
+			if sa, ok := a.executor.(StepAwareExecutor); ok {
+				sa.SetStep(step+1, "retry")
+				if a.config.Verbose {
+					fmt.Printf("├─ Step %d: ⚠ Very low confidence (%.0f%%) → forcing strong model\n", step+1, lastConfidence*100)
+				}
+			}
+		} else if lastConfidence < 0.6 && a.governor != nil {
+			// Low confidence → escalate to strong model
+			if sa, ok := a.executor.(StepAwareExecutor); ok {
+				sa.SetStep(step+1, "complete") // "complete" uses strong model in cost_optimized
+				if a.config.Verbose {
+					fmt.Printf("├─ Step %d: ⚠ Low confidence (%.0f%%) → preferring strong model\n", step+1, lastConfidence*100)
+				}
+			}
+		}
+
 		prompt := buildPrompt(history)
 
-		// these tell the router what step type this is (if router is being used).
-		// Finally this enables per-step model routing: tool calls → fast model, reasoning → strong model.
-		if sa, ok := a.executor.(StepAwareExecutor); ok {
-			isRetry := step > 0 && len(result.Steps) > 0 && strings.HasSuffix(result.Steps[len(result.Steps)-1].Action, "retry")
-			prevAction := ""
-			if len(result.Steps) > 0 {
-				prevAction = result.Steps[len(result.Steps)-1].Action
+		// Standard step classification (only if governor didn't override above)
+		if lastConfidence >= 0.6 {
+			if sa, ok := a.executor.(StepAwareExecutor); ok {
+				isRetry := step > 0 && len(result.Steps) > 0 && strings.HasSuffix(result.Steps[len(result.Steps)-1].Action, "retry")
+				prevAction := ""
+				if len(result.Steps) > 0 {
+					prevAction = result.Steps[len(result.Steps)-1].Action
+				}
+				stepType := classifyAgentStep(step+1, isRetry, prevAction)
+
+				// Task-type override: complex tasks force strong model for reasoning
+				if stepType == "complete" {
+					switch taskType {
+					case "ranking", "reasoning", "multi_step", "coding":
+						stepType = "complete" // ensure strong model (already "complete", but explicit)
+					}
+				}
+
+				sa.SetStep(step+1, stepType)
 			}
-			stepType := classifyAgentStep(step+1, isRetry, prevAction)
-			sa.SetStep(step+1, stepType)
 		}
 
 		response, err := a.executor.Execute(systemPrompt, prompt)
@@ -434,6 +595,58 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 				record.Output = toolCall.Result
 				toolCallSucceeded = true
 
+				// ── Governor: Verify tool call output before accepting ──
+				if a.governor != nil && a.governor.Verifier != nil {
+					verdict := a.governor.Verifier.VerifyToolCall(a.config.Model, toolCall.Name, toolCall, response)
+					lastConfidence = verdict.Confidence
+					if !verdict.Passed {
+						if a.config.Verbose {
+							fmt.Printf("│  ↳ ✗ VERIFY FAILED: %s\n", verdict.Reason)
+						}
+						// Record in registry
+						if a.governor.Registry != nil {
+							a.governor.Registry.Record(a.config.Model, "verification_failed", taskType, toolCall.Name, 0, 0, verdict.Flags[0])
+						}
+						// Check if we should escalate to strong model
+						if a.governor.Verifier.ShouldEscalate(taskID, false) {
+							record.Action = "verify_escalate"
+							result.Steps = append(result.Steps, record)
+							history = append(history, message{
+								Role:    "user",
+								Content: fmt.Sprintf("The previous tool call result was rejected by verification (%s). Please re-examine and try again more carefully.", verdict.Reason),
+							})
+							continue
+						}
+						// Can't escalate further — accept with warning
+						if a.config.Verbose {
+							fmt.Printf("│  ↳ ⚠ Accepting despite failed verification (max escalations reached)\n")
+						}
+					} else {
+						if a.config.Verbose {
+							fmt.Printf("│  ↳ ✓ Verified (confidence: %.0f%%)\n", verdict.Confidence*100)
+						}
+						// Fix 6: Low confidence → hint router to prefer strong model next
+						if verdict.Confidence < 0.6 {
+							if sa, ok := a.executor.(StepAwareExecutor); ok {
+								sa.SetStep(step+2, "retry") // force strong model for next step
+								if a.config.Verbose {
+									fmt.Printf("│  ↳ ⚠ Low confidence — next step will use strong model\n")
+								}
+							}
+						}
+						// Record in registry — use confidence to determine success quality
+						// Include task type for context-aware learning
+						if a.governor.Registry != nil {
+							obsKind := "tool_call_success"
+							if verdict.Confidence < 0.6 {
+								obsKind = "verification_failed"
+							}
+							a.governor.Registry.Record(a.config.Model, obsKind, taskType, toolCall.Name,
+								float64(response.Latency.Milliseconds()), 0, "")
+						}
+					}
+				}
+
 				if a.config.Verbose {
 					preview := toolCall.Result
 					if len(preview) > 80 {
@@ -454,10 +667,16 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 					Role:    "assistant",
 					Content: fmt.Sprintf("I called %s and got results.", toolCall.Name),
 				})
+
+				// ── Fix: Trim tool output before sending to LLM ──
+				// Raw tool output can be thousands of tokens. Trim to essential fields
+				// to cut reasoning cost by 50-70%.
+				trimmedResult := trimToolOutput(toolCall.Result, 1500)
+
 				history = append(history, message{
 					Role: "user",
 					Content: fmt.Sprintf("Tool %s returned this data:\n%s\n\nUsing ONLY the data above, answer the original question. Do NOT make up information.",
-						toolCall.Name, toolCall.Result),
+						toolCall.Name, trimmedResult),
 				})
 			}
 
@@ -489,6 +708,46 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			Duration: response.Latency,
 			Strategy: plan.Strategy,
 		}
+
+		// ── Governor: Verify reasoning output before accepting ──
+		if a.governor != nil && a.governor.Verifier != nil {
+			verdict := a.governor.Verifier.VerifyReasoning(a.config.Model, response, toolsWereLoaded, toolCallSucceeded)
+			lastConfidence = verdict.Confidence
+			if !verdict.Passed {
+				if a.config.Verbose {
+					fmt.Printf("├─ Step %d: ✗ REASONING VERIFY FAILED — %s\n", step+1, verdict.Reason)
+				}
+				if a.governor.Registry != nil {
+					errClass := "reasoning_failed"
+					if len(verdict.Flags) > 0 {
+						errClass = verdict.Flags[0]
+					}
+					a.governor.Registry.Record(a.config.Model, "reasoning_failure", taskType, "", 0, 0, errClass)
+				}
+				if a.governor.Verifier.ShouldEscalate(taskID, false) {
+					record.Action = "verify_escalate"
+					result.Steps = append(result.Steps, record)
+					history = append(history, message{
+						Role:    "user",
+						Content: fmt.Sprintf("Your response was rejected by verification (%s). Please provide a more careful, grounded answer.", verdict.Reason),
+					})
+					continue
+				}
+			} else {
+				if a.config.Verbose {
+					fmt.Printf("├─ Step %d: ✓ Reasoning verified (confidence: %.0f%%)\n", step+1, verdict.Confidence*100)
+				}
+				if a.governor.Registry != nil {
+					obsKind := "reasoning_success"
+					if verdict.Confidence < 0.6 {
+						obsKind = "reasoning_failure"
+					}
+					a.governor.Registry.Record(a.config.Model, obsKind, taskType, "",
+						float64(response.Latency.Milliseconds()), 0, "")
+				}
+			}
+		}
+
 		result.Steps = append(result.Steps, record)
 		result.Success = true
 		result.Output = finalText
@@ -528,6 +787,16 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 	}
 
 	a.Metrics.recordTask(result)
+
+	// ── Governor: cleanup and report ──
+	if a.governor != nil {
+		if a.governor.Verifier != nil {
+			a.governor.Verifier.ResetEscalations(taskID)
+		}
+		if a.config.Verbose && a.governor.Registry != nil {
+			fmt.Print(a.governor.Registry.FormatReport())
+		}
+	}
 
 	return result
 }
@@ -835,4 +1104,87 @@ func RunDemo(mgr *ctx.Manager) {
 	fmt.Println("  This is the difference between a static optimizer and")
 	fmt.Println("  a context decision engine. ARK observes, adapts, recovers.")
 	fmt.Println()
+}
+
+// trimToolOutput reduces raw tool output to essential content to save tokens.
+// JSON arrays get truncated to maxItems. Long strings get cut. This alone
+// can reduce reasoning cost by 50-70%.
+// Also enforces diversity — prevents cluster bias from same org/owner.
+func trimToolOutput(raw string, maxChars int) string {
+	if len(raw) <= maxChars {
+		return raw
+	}
+
+	// Try to parse as JSON array and keep only essential fields
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "[") {
+		var items []map[string]interface{}
+		if err := json.Unmarshal([]byte(trimmed), &items); err == nil {
+			maxItems := 10
+			if len(items) > maxItems {
+				items = items[:maxItems]
+			}
+
+			essentialFields := map[string]bool{
+				"name": true, "full_name": true, "title": true,
+				"description": true, "stars": true, "stargazers_count": true,
+				"id": true, "number": true, "state": true,
+				"url": true, "html_url": true,
+				"author": true, "created_at": true, "labels": true,
+				"language": true, "forks_count": true, "open_issues_count": true,
+			}
+
+			// Diversity enforcement: detect cluster bias by owner/org
+			// If >50% of items share the same owner prefix, deduplicate
+			cleaned := make([]map[string]interface{}, 0, len(items))
+			ownerCount := make(map[string]int)
+
+			for _, item := range items {
+				slim := make(map[string]interface{})
+				for k, v := range item {
+					if essentialFields[k] {
+						if s, ok := v.(string); ok && len(s) > 200 {
+							slim[k] = s[:200] + "..."
+						} else {
+							slim[k] = v
+						}
+					}
+				}
+				if len(slim) > 0 {
+					// Extract owner from full_name (e.g. "django/django" → "django")
+					owner := extractOwner(slim)
+					ownerCount[owner]++
+
+					// Allow max 2 items per owner to prevent clustering
+					if ownerCount[owner] <= 2 {
+						cleaned = append(cleaned, slim)
+					}
+				}
+			}
+
+			if data, err := json.Marshal(cleaned); err == nil {
+				result := string(data)
+				if len(result) <= maxChars {
+					return result
+				}
+			}
+		}
+	}
+
+	// Fallback: simple truncation
+	return raw[:maxChars] + "\n... [trimmed by ARK to save tokens]"
+}
+
+// extractOwner pulls the org/owner from a repo item for diversity checks.
+func extractOwner(item map[string]interface{}) string {
+	if fullName, ok := item["full_name"].(string); ok {
+		parts := strings.SplitN(fullName, "/", 2)
+		if len(parts) > 0 {
+			return strings.ToLower(parts[0])
+		}
+	}
+	if name, ok := item["name"].(string); ok {
+		return strings.ToLower(name)
+	}
+	return ""
 }
