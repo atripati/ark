@@ -8,26 +8,36 @@ It decides which tools run, which model handles each step, how much each decisio
 
 ```
 ┌─ ARK Agent: Task "ark-run"
-│  find the top 5 most popular JavaScript backend frameworks on GitHub
+│  write a function in Go that reads CSV
 │
-├─ Task type: ranking
-├─ Context: loaded 3 tools (93 tokens) [strategy: minimal]
-├─ Step 1: TOOL_CALL — github_search_repos
-│  ↳ ✓ Verified (confidence: 88%)
-├─ Step 2: ✓ Reasoning verified (confidence: 87%)
-├─ Step 2: COMPLETE — NestJS (75K★), Express (69K★), Socket.IO (63K★)...
+├─ Task type: coding
+├─ Context: loaded 2 tools (42 tokens) [strategy: minimal]
+├─ Step 1: ✓ Reasoning verified (confidence: 70%)
+│  🧪 Verification: tested (score: 100%)
+│  ✅ Compiled
+│  ✅ Executed
+│  ✅ Tests passed
+│  ✅ Lint clean
+├─ Step 1: COMPLETE — func readCSV(filePath string) ([][]string, error)
 │
-└─ Done: 2 steps, 1406 tokens, 6.5s | Cost: $0.005
+└─ Done: 1 step, 637 tokens, 5.6s | Cost: $0.002
 
-  💰 Cost: $0.005 per task (not $0.05)
-  🧠 Routing: gpt-4o-mini → tool call, gpt-4o → reasoning
-  🔍 Governor: verified both steps, variable confidence
-  📊 Learning: 258 observations, 99% success rate
+════════════════════════════════════════════════════════════
+  🧠 ARK Memory — Learning from this execution
+════════════════════════════════════════════════════════════
+
+  📥 Ingested 2 new events
+  📊 Total experience: 20 memories
+  🚀 Context for next run:
+     Tool experience: github_search_repos — 100% success (2 uses)
+     Past: 'find Python frameworks' succeeded in 2 steps, $0.005
+     Past: 'write CSV reader' succeeded in 1 step, $0.002
 ```
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go)](https://go.dev)
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-156%20passing-brightgreen?style=flat-square)]()
+[![Tests](https://img.shields.io/badge/Tests-210%2B%20passing-brightgreen?style=flat-square)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
 
 ---
@@ -134,7 +144,103 @@ Phase 7: Simplify
 
 The LLM never decides what's relevant. The runtime ranks. The LLM explains.
 
-### 4. Decision-Level Cost Attribution
+### 4. Code Verification Engine
+
+ARK doesn't trust generated code. It compiles, runs, and tests it before delivering.
+
+```
+├─ Step 1: ✓ Reasoning verified (confidence: 70%)
+│  🧪 Verification: tested (score: 100%)
+│  ✅ Compiled         ← go build passed
+│  ✅ Executed          ← go run passed
+│  ✅ Tests passed      ← auto-generated tests passed
+│  ✅ Lint clean        ← go vet passed
+│  ✔ code_extraction (1 code block(s) found)
+│  ✔ structural_lint (0 issues)
+│  ✔ constraints (0 violations)
+│  ✔ compilation (compiled successfully)
+│  ✔ execution (ran without error)
+│  ✔ tests (auto-generated tests passed)
+│  ✔ lint (0 warnings)
+```
+
+The verification pipeline:
+
+| Phase | What it does |
+|-------|-------------|
+| Extract | Pull code blocks, auto-detect language |
+| Auto-Fix | Fix common model errors (orphan braces, missing error handling) |
+| Structural Lint | Check braces, parens, completeness, placeholders |
+| Constraint Check | Over-commenting, filler comments, unused imports |
+| Compile | `go build` / `python -m py_compile` / `node --check` |
+| Execute | Run with 10s timeout |
+| Auto-Test | Generate smoke tests for functions, run `go test` |
+| Lint | `go vet` for static analysis |
+
+If code fails verification, ARK self-corrects: feeds the compiler error back to the model, forces the strong model, and retries. If it still fails after 2 attempts, ARK refuses to deliver broken code.
+
+### 5. ARK Memory — Persistent Agent Experience
+
+Every AI agent has amnesia. ARK Memory fixes it.
+
+```python
+from ark_memory import Agent, Experience
+
+agent = Agent("my-agent")
+exp = Experience(agent)
+
+# Agent learns from every execution automatically
+exp.tool_succeeded("github_search_repos", "python frameworks", duration_ms=2500)
+exp.tool_failed("web_search", "latest news", error="API key missing")
+exp.strategy_learned("coding", "strip test instructions", improvement="eliminated import conflicts")
+
+# Next run — agent queries its own experience
+best = exp.best_tool_for("search repositories")
+# → github_search_repos: 100% success, avg 2500ms
+
+context = exp.execution_context("coding task")
+# → Learned strategies, tool performance, failures to avoid
+```
+
+ARK Memory is a separate Python package (`pip install ark-memory`) with:
+- SQLite persistence — survives crashes, zero config
+- Semantic search via cosine similarity on embeddings
+- Time decay with configurable half-life
+- Namespace isolation (per agent, per user, per session)
+- Anti-redundancy deduplication
+- Auto-learning collector that ingests Runtime events
+
+### 6. Unified Execution — One Command, Both Layers
+
+```bash
+./ark-run.sh "write a function in Go that reads CSV"
+```
+
+Runtime executes the task → emits events → Memory ingests them automatically. Each run makes the next one smarter.
+
+```
+════════════════════════════════════════════════════════════
+  🧠 ARK Memory — Learning from this execution
+════════════════════════════════════════════════════════════
+
+  📥 Ingested 2 new events
+  📊 Total experience: 20 memories
+     Tool successes: 7
+     Executions: 10
+
+  🚀 Context for next run:
+  Tool experience:
+    - github_search_repos: 100% success (2 uses)
+  Past execution history:
+    - Task 'write CSV reader' succeeded in 1 step, $0.002
+    - Task 'find Python frameworks' succeeded in 2 steps, $0.005
+
+════════════════════════════════════════════════════════════
+  Every run makes the next one smarter.
+════════════════════════════════════════════════════════════
+```
+
+### 7. Decision-Level Cost Attribution
 
 Every step has a price tag. Cost feeds back into ranking.
 
@@ -209,7 +315,18 @@ go run ./cmd/ark demo-learn   # see ranking improve across 3 runs
 # With OpenAI (~$0.005 per task)
 export OPENAI_API_KEY=sk-...
 export GITHUB_TOKEN=ghp_...
-go run ./cmd/ark run agent.yaml --task "find the top 3 most popular Python web frameworks on GitHub"
+
+# Run Runtime only
+go run ./cmd/ark run agent.yaml --task "find the top 3 Python web frameworks on GitHub"
+
+# Run Runtime + Memory together (one command)
+chmod +x ark-run.sh
+./ark-run.sh "find the top 3 Python web frameworks on GitHub"
+
+# Install ARK Memory separately
+cd ark-memory
+pip install -e .
+pytest tests/ -v   # 55+ tests
 ```
 
 ## Configuration
@@ -291,21 +408,35 @@ ark run agent.yaml --task "create issue" --dry-run      # ✅ simulate
 
 ```
 ark/
-├── cmd/ark/                    CLI (run, bench, demo, init)
+├── cmd/ark/                    CLI entry point
+│   └── main.go                 Config, agent setup, event emitter init
+├── ark-memory/                 Persistent agent memory (Python)
+│   ├── ark_memory/
+│   │   ├── agent.py            Agent class (remember/recall/context/forget)
+│   │   ├── store.py            SQLite persistence, vector search, multi-signal ranking
+│   │   ├── embeddings.py       Local hash-based + optional OpenAI embeddings
+│   │   ├── experience.py       Experience engine (tool tracking, strategy learning)
+│   │   ├── collector.py        Auto-learning collector (ingests Runtime events)
+│   │   └── types.py            Memory, RecallResult, MemoryConfig
+│   └── tests/                  55+ tests
+├── ark-run.sh                  Unified run script (Runtime + Memory)
 ├── pkg/
-│   ├── config/                 YAML config parser + validation (14 tests)
-│   ├── context/                Context engine + adaptive ranker + memory
-│   │   ├── manager.go          Budget allocation, compression, eviction
-│   │   └── engine.go           Tool ranking, intent matching, scoring
+│   ├── config/                 YAML config + validation
+│   ├── context/                Context engine (99.9% reduction)
+│   │   ├── engine.go           Tool ranking (6 signals, Bayesian confidence)
+│   │   └── manager.go          Context window management
 │   ├── governor/               Cognitive supervisor
 │   │   ├── registry.go         Model capability registry (Bayesian learning)
 │   │   ├── verifier.go         Output verification (variable confidence)
-│   │   ├── intelligence.go     Task classification, failure prediction, effort allocation
+│   │   ├── intelligence.go     Task classification, failure prediction
 │   │   └── adapter.go          Runtime bridge
 │   ├── models/                 LLM providers (Anthropic, OpenAI, Ollama)
 │   ├── router/                 Per-step model routing (persistent learning)
 │   ├── runtime/                Agent execution loop
-│   │   └── agent.go            Governor integration, tool output trimming, diversity
+│   │   ├── agent.go            Execution loop, governor integration
+│   │   ├── verify.go           Code verification (compile, test, lint)
+│   │   ├── quality.go          Quality layer (auto-fix, prompt optimization)
+│   │   └── events.go           Event emitter (JSONL bridge to Memory)
 │   ├── cost/                   Decision-level cost attribution
 │   ├── store/                  Persistent learning (JSON, decay, snapshots)
 │   └── tools/                  Tool implementations
@@ -314,8 +445,9 @@ ark/
 │       ├── filesystem.go       File system (read/write/list)
 │       └── custom.go           Custom HTTP tool engine
 
-156 tests | Race detector clean | 12 tools | Per-step model routing
-Cognitive governor | Variable confidence | Task classification
+Go Runtime:  35 files | 156+ tests | Race detector clean | 12 tools
+Python Memory: 9 files | 55+ tests | Zero config | 4,800 events/sec
+Total: 44 files | 210+ tests | One command runs both layers
 ```
 
 ## How the Scoring Works
@@ -338,15 +470,19 @@ New tools get an exploration bonus (+0.15) so they can compete with established 
 | Guarantee | How |
 |-----------|-----|
 | No hallucination when tools available | Governor blocks ungrounded responses |
+| Code is verified before delivery | Compile → execute → test → lint pipeline |
+| Never delivers broken code as success | Hard fail enforcement after max retries |
+| Auto-fixes common model errors | Orphan braces, missing error handling, indentation |
 | Variable confidence | 88% grounded, 75% pure reasoning, 50% ungrounded |
 | No invalid tool calls | RequiredParams validated before execution |
-| No runaway loops | MaxSteps=5, TotalTimeout=120s, per-tool retry budget |
+| No runaway loops | MaxSteps=5, TotalTimeout=120s, per-tool retry budget, max 2 self-corrections |
 | Cost-aware | Per-decision cost graph, budget enforcement |
-| Self-improving | Bayesian learning, persistent across restarts |
+| Self-improving | Bayesian learning + experience memory, persistent across restarts |
 | Failure prediction | Governor predicts failures before execution |
-| Task-aware routing | Ranking tasks force strong model |
+| Task-aware routing | Ranking tasks force strong model, tool calls use cheap model |
 | Diversity enforcement | Max 2 repos per owner, junk filtering |
 | Semantic scoring | 3-tier relevance (boost / penalize / bury) |
+| Experience accumulation | Every run feeds into the next via ARK Memory |
 
 ## Stress Tested
 
@@ -362,7 +498,7 @@ Failures handled correctly:
 
 ## Roadmap
 
-### v1.0 — Cognitive Governor ✅ (current)
+### v1.0 — Cognitive Governor ✅
 - [x] Cognitive governor (verifier + registry + intelligence layer)
 - [x] Task classification (ranking, retrieval, coding, multi_step, reasoning)
 - [x] Variable confidence (model history + tool track record + response quality)
@@ -377,15 +513,26 @@ Failures handled correctly:
 - [x] Tool output trimming (50-70% token reduction)
 - [x] 156 tests, race detector clean, 12 tools
 
-### v1.1 — MCP Protocol (next)
+### v1.1 — Code Verification + ARK Memory ✅ (current)
+- [x] Code verification engine (compile, execute, test, lint)
+- [x] Auto-fix: orphan braces, missing error handling, space/tab indentation
+- [x] Task decomposition: strip test instructions from coding tasks
+- [x] Self-correction: 2 retries with strong model, history reset
+- [x] Hard fail enforcement: never deliver broken code as success
+- [x] Quality layer: prompt optimization, response cleaning
+- [x] ARK Memory: persistent semantic memory (Python, SQLite, zero config)
+- [x] Experience engine: tool tracking, strategy learning, model performance
+- [x] Auto-learning collector: ingests Runtime events automatically
+- [x] Event bridge: Go Runtime emits JSONL → Python Memory ingests
+- [x] Unified execution: `ark-run.sh` runs both layers with one command
+- [x] 55+ Python tests, stress tested at 4,800 events/sec
+- [x] 210+ total tests across Runtime + Memory
+
+### v1.2 — Adaptive Execution (next)
+- [ ] Multi-step adaptive chains (fail → recall experience → adapt → succeed)
+- [ ] Experience-aware routing (Memory informs Runtime decisions)
 - [ ] MCP server connector (stdio/SSE)
 - [ ] Auto-discover tools from MCP servers
-- [ ] ARK manages context for any MCP-connected tool
-
-### v1.2 — Production Storage
-- [ ] SQLite backend
-- [ ] Multi-agent shared memory
-- [ ] Semantic query clustering
 
 ### v1.3 — Production Runtime
 - [ ] Streaming output
@@ -393,6 +540,7 @@ Failures handled correctly:
 - [ ] Plugin system
 - [ ] OpenTelemetry export
 - [ ] `go get github.com/atripati/ark` library mode
+- [ ] DSL prototype: 10 lines replaces 1000 lines of Python+SQL+VectorDB
 
 ## Contributing
 
