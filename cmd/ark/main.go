@@ -730,6 +730,13 @@ func runAgent(configPath, task string, allowWrite, dryRun bool) {
 	gov := governor.NewGovernorForRuntime(govRegistry, govVerifier)
 	agent = runtime.NewAgentWithGovernor(engine, modelRouter, toolRouter, agentConfig, gov)
 
+	// Initialize event emitter for ARK Memory bridge
+	eventEmitter, emitErr := runtime.NewEventEmitter("./ark-events.jsonl")
+	if emitErr == nil {
+		agent.Events = eventEmitter
+		defer eventEmitter.Close()
+	}
+
 	// Load router learning from prior runs
 	routerLearningPath := "./ark-router-learning.json"
 	if modelRouter.Strategy() != modelrouter.StrategySingle {

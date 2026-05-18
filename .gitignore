@@ -28,3 +28,11 @@ Thumbs.db
 # ARK data files
 *.db
 ark-memory.db
+.gocache/
+ark-events.jsonl
+ark-experience.db
+*.db
+__pycache__/
+*.egg-info/
+*.db-shm
+*.db-wal

@@ -146,6 +146,7 @@ type Agent struct {
 	config   AgentConfig
 	governor *Governor
 	Metrics  *RuntimeMetrics
+	Events   *EventEmitter
 }
 
 type AgentConfig struct {
@@ -370,6 +371,9 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 	toolContext := a.engine.Manager().Render()
 	systemPrompt := buildSystemPrompt(toolContext, plan.ToolsLoaded)
 
+	// ── Quality Layer: Enhance system prompt with task-specific directives ──
+	systemPrompt = EnhanceSystemPrompt(systemPrompt, taskType)
+
 	// ── Governor: Inject experience context into system prompt ──
 	if a.governor != nil && a.governor.Registry != nil {
 		experienceHints := a.governor.Registry.BuildExperienceContext(a.config.Model, "")
@@ -382,13 +386,34 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 	}
 
 	var history []message
-	history = append(history, message{Role: "user", Content: task})
+
+	// ── Quality Layer: Optimize user prompt before sending to model ──
+	optimizedTask := OptimizePrompt(task, taskType)
+
+	// ── Task Decomposition: For coding tasks that ask for tests,
+	// generate code FIRST without tests. Tests break single-file compilation. ──
+	if taskType == "coding" {
+		lower := strings.ToLower(task)
+		if strings.Contains(lower, "test") || strings.Contains(lower, "unit test") {
+			// Strip test-related instructions from the first generation
+			optimizedTask = stripTestInstructions(optimizedTask)
+			optimizedTask += "\n\nIMPORTANT: Generate ONLY the main code. Do NOT include any test code, do NOT import \"testing\". Tests will be generated separately."
+			if a.config.Verbose {
+				fmt.Printf("├─ Task decomposition: tests stripped from first generation\n")
+			}
+		}
+	}
+
+	history = append(history, message{Role: "user", Content: optimizedTask})
 
 	toolsWereLoaded := len(plan.ToolsLoaded) > 0
 	toolCallSucceeded := false
 	toolRetries := make(map[string]int)
 	deadline := time.Now().Add(a.config.TotalTimeout)
-	lastConfidence := 1.0 // tracks verification confidence across steps
+	lastConfidence := 1.0
+	selfCorrecting := false
+	selfCorrectCount := 0
+	maxSelfCorrections := 2 // 2 retries max — if model can't fix it in 2 tries, stop burning tokens
 
 	for step := 0; step < a.config.MaxSteps; step++ {
 		if time.Now().After(deadline) {
@@ -455,7 +480,15 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 		prompt := buildPrompt(history)
 
 		// Standard step classification (only if governor didn't override above)
-		if lastConfidence >= 0.6 {
+		if selfCorrecting {
+			// Self-correction ALWAYS uses strong model
+			if sa, ok := a.executor.(StepAwareExecutor); ok {
+				sa.SetStep(step+1, "retry")
+				if a.config.Verbose {
+					fmt.Printf("├─ Step %d: ↻ Using strong model for self-correction\n", step+1)
+				}
+			}
+		} else if lastConfidence >= 0.6 {
 			if sa, ok := a.executor.(StepAwareExecutor); ok {
 				isRetry := step > 0 && len(result.Steps) > 0 && strings.HasSuffix(result.Steps[len(result.Steps)-1].Action, "retry")
 				prevAction := ""
@@ -576,6 +609,16 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 					TokensUsed:  response.TokensUsed,
 					Latency:     response.Latency,
 				}
+
+				// ── Event: tool call failed ──
+				if a.Events != nil {
+					queryStr := ""
+					if q, ok := toolCall.Params["query"]; ok {
+						queryStr = fmt.Sprintf("%v", q)
+					}
+					a.Events.EmitToolCall(toolCall.Name, queryStr, false,
+						float64(response.Latency.Milliseconds()), response.TokensUsed, 0, toolErr.Error())
+				}
 				newPlan := a.engine.AdaptContext(plan, execResult)
 				if newPlan != nil {
 					plan = newPlan
@@ -594,6 +637,16 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			} else {
 				record.Output = toolCall.Result
 				toolCallSucceeded = true
+
+				// ── Event: tool call succeeded ──
+				if a.Events != nil {
+					queryStr := ""
+					if q, ok := toolCall.Params["query"]; ok {
+						queryStr = fmt.Sprintf("%v", q)
+					}
+					a.Events.EmitToolCall(toolCall.Name, queryStr, true,
+						float64(response.Latency.Milliseconds()), response.TokensUsed, 0, "")
+				}
 
 				// ── Governor: Verify tool call output before accepting ──
 				if a.governor != nil && a.governor.Verifier != nil {
@@ -684,7 +737,10 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 			continue
 		}
 
-		if toolsWereLoaded && !toolCallSucceeded {
+		// Grounding gate: reject ungrounded answers when tools are needed.
+		// Skip for coding/reasoning/summarization — these tasks don't need tool data.
+		groundingRequired := taskType != "coding" && taskType != "reasoning" && taskType != "summarization" && taskType != "general"
+		if toolsWereLoaded && !toolCallSucceeded && groundingRequired {
 			if a.config.Verbose {
 				fmt.Printf("├─ Step %d: GROUNDING GATE — rejecting ungrounded answer, forcing tool use\n", step+1)
 			}
@@ -711,7 +767,13 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 
 		// ── Governor: Verify reasoning output before accepting ──
 		if a.governor != nil && a.governor.Verifier != nil {
-			verdict := a.governor.Verifier.VerifyReasoning(a.config.Model, response, toolsWereLoaded, toolCallSucceeded)
+			// For coding/reasoning/summarization, tools are loaded but not required.
+			// Tell the verifier that tool grounding is not needed for this task type.
+			groundingNeeded := taskType != "coding" && taskType != "reasoning" && taskType != "summarization" && taskType != "general"
+			effectiveToolsLoaded := toolsWereLoaded && groundingNeeded
+			effectiveToolsCalled := toolCallSucceeded
+
+			verdict := a.governor.Verifier.VerifyReasoning(a.config.Model, response, effectiveToolsLoaded, effectiveToolsCalled)
 			lastConfidence = verdict.Confidence
 			if !verdict.Passed {
 				if a.config.Verbose {
@@ -750,7 +812,134 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 
 		result.Steps = append(result.Steps, record)
 		result.Success = true
+
+		// ── Quality Layer: Clean and structure response before delivery ──
+		qualityConfig := DefaultQualityConfig()
+		if taskType == "coding" {
+			qualityConfig.StripExplanations = true
+
+			// Auto-fix common Go errors in the output before delivering to user.
+			// We rebuild the entire response with fixed code blocks.
+			finalText = autoFixCodeInResponse(finalText)
+		}
+		finalText = CleanResponse(finalText, taskType, qualityConfig)
+		finalText = DeduplicateResponse(finalText)
+
+		// ── Verification Engine: Validate response correctness ──
+		// Verify the CLEANED output (after auto-fix), not the raw model response.
+		verification := VerifyResponse(finalText, taskType)
+
+		// Hard gate: if structural lint still finds unbalanced braces after auto-fix,
+		// the code is truly broken — don't trust the compilation result.
+		if taskType == "coding" && verification.Report != nil {
+			for _, check := range verification.Report.Checks {
+				if check.Name == "structural_lint" && !check.Passed {
+					verification.Passed = false
+					if verification.Score > 0.50 {
+						verification.Score = 0.50
+					}
+				}
+			}
+
+			// ── Event: verification result ──
+			if a.Events != nil {
+				compiled := false
+				testsPassed := false
+				if verification.CodeResult != nil {
+					compiled = verification.CodeResult.Compiled
+					testsPassed = verification.CodeResult.TestsPassed
+				}
+				a.Events.EmitVerification(task, verification.Level, verification.Score, compiled, testsPassed)
+			}
+		}
+
+		if a.config.Verbose {
+			levelIcon := "📋"
+			switch verification.Level {
+			case "tested":
+				levelIcon = "🧪"
+			case "executed":
+				levelIcon = "⚡"
+			case "compiled":
+				levelIcon = "🔨"
+			}
+			fmt.Printf("│  %s Verification: %s (score: %.0f%%)\n", levelIcon, verification.Level, verification.Score*100)
+			if verification.CodeResult != nil {
+				if verification.CodeResult.Compiled {
+					fmt.Printf("│  ✅ Compiled\n")
+				}
+				if verification.CodeResult.Ran {
+					fmt.Printf("│  ✅ Executed\n")
+				}
+				if verification.CodeResult.TestsPassed {
+					fmt.Printf("│  ✅ Tests passed\n")
+				}
+				if verification.CodeResult.Linted && len(verification.CodeResult.LintIssues) == 0 {
+					fmt.Printf("│  ✅ Lint clean\n")
+				}
+				if !verification.CodeResult.Compiled && verification.CodeResult.Error != "" {
+					fmt.Printf("│  ❌ Compilation failed: %s\n", verification.CodeResult.Error)
+				}
+			}
+			// Print verification report checks
+			if verification.Report != nil {
+				for _, check := range verification.Report.Checks {
+					icon := "✔"
+					if !check.Passed {
+						icon = "✗"
+					}
+					detail := ""
+					if check.Detail != "" {
+						detail = " (" + check.Detail + ")"
+					}
+					fmt.Printf("│  %s %s%s\n", icon, check.Name, detail)
+				}
+			}
+			for _, issue := range verification.Issues {
+				fmt.Printf("│  ⚠ %s\n", issue)
+			}
+		}
+
+		// ── Self-Correction: If verification fails, retry with error feedback ──
+		if !verification.Passed && step < a.config.MaxSteps-1 && selfCorrectCount < maxSelfCorrections {
+			selfCorrecting = true
+			selfCorrectCount++
+			if a.config.Verbose {
+				fmt.Printf("├─ Step %d: ↻ SELF-CORRECTING — verification score %.0f%% below threshold\n", step+1, verification.Score*100)
+			}
+			retryPrompt := BuildRetryPrompt(finalText, verification)
+
+			if taskType == "coding" {
+				retryPrompt += "\n\nCRITICAL: Return ONLY the complete, corrected code inside a single code block. Ensure all braces are balanced, all imports are present, and the code compiles without errors. Do NOT explain — just provide the fixed code."
+			}
+
+			// Don't accumulate broken code in history — it pollutes context
+			// and makes the model repeat the same mistake.
+			// Instead, reset history to original task + error feedback only.
+			history = []message{
+				{Role: "user", Content: optimizedTask},
+				{Role: "user", Content: retryPrompt},
+			}
+			// Force strong model for retry
+			if sa, ok := a.executor.(StepAwareExecutor); ok {
+				sa.SetStep(step+2, "retry")
+			}
+			result.Success = false
+			result.Output = ""
+			continue // go to next step with correction feedback
+		}
+
 		result.Output = finalText
+		selfCorrecting = false
+
+		// If verification ran and failed, mark output accordingly
+		if verification.Score > 0 && !verification.Passed {
+			// Verification failed after all retries — this is NOT a success
+			result.Success = false
+			result.Output = finalText + "\n\n❌ ARK: Verification failed (score: " +
+				fmt.Sprintf("%.0f%%", verification.Score*100) + "). Issues: " + strings.Join(verification.Issues, "; ") +
+				"\nARK could not produce verified output for this task. The code above may contain errors."
+		}
 
 		if a.config.Verbose {
 			preview := finalText
@@ -763,6 +952,13 @@ func (a *Agent) Run(taskID, task string) *TaskResult {
 	}
 
 	result.TotalTime = time.Since(startTime)
+
+	// ── Event: task complete ──
+	if a.Events != nil {
+		a.Events.EmitTaskComplete(task, len(result.Steps),
+			0, result.TotalTokens, float64(result.TotalTime.Milliseconds()),
+			result.Success, a.config.Model)
+	}
 
 	for _, step := range result.Steps {
 		costTracker.RecordStep(step.Step, step.InputTokens, step.OutputTokens, step.Action, step.ToolName, step.Duration)
