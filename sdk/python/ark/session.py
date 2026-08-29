@@ -1,0 +1,232 @@
+"""External-agent integration: ``with ark.trace(...) as run:``.
+
+The developer keeps their own agent/model/tools and drives their own loop. Inside the
+trace they REPORT what happened (``run.record(...)``) and, optionally, ask ARK to gate a
+proposed action before executing it (``run.check(...)``). On exit ARK returns the canonical
+``RunResult`` — the same contract ``ARK.run`` produces.
+
+This module is a THIN line-protocol client over a persistent ``ark-bridge --session``
+process. All session state that ARK owns — retry counters, verdict semantics, recovery
+logic, stable decision IDs, cost pricing, aggregate derivation — lives in Go, so Python
+never reimplements or drifts from it. Fields ARK cannot observe (model, tokens, tool,
+latency, verification, routing) are reported by the developer and are marked as such in
+``run.provenance``; they are never presented as if ARK observed them directly.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+from typing import Any, Optional
+
+from .bridge import _find_binary
+from .errors import ArkError, ArkBridgeError, ArkSupervisionDisabled
+from .models import RunResult
+
+
+class Verdict:
+    """One supervision verdict, and the stable handle for the decision it created.
+
+    Pass it back as ``run.record(..., of=verdict)`` so the executed telemetry lands on the
+    SAME DecisionRecord as the verdict — an unambiguous proposal -> execution audit chain.
+    ``suggested`` is runtime-derived EVIDENCE (e.g. the rank-2 option id); ARK never authors
+    the replacement action — your agent re-proposes.
+    """
+
+    def __init__(self, d: dict):
+        self.decision_id: Optional[str] = d.get("decision_id")
+        self.verdict: Optional[str] = d.get("verdict")
+        self.reason: Optional[str] = d.get("reason")
+        self.retry_number: Optional[int] = d.get("retry_number")
+        self.suggested: Optional[str] = d.get("suggested") or None
+        self.allowed: bool = bool(d.get("allowed"))
+
+    def __repr__(self) -> str:
+        return (f"Verdict(verdict={self.verdict!r}, allowed={self.allowed}, "
+                f"suggested={self.suggested!r}, id={self.decision_id!r})")
+
+
+class _SessionProc:
+    """A persistent ``ark-bridge --session`` subprocess speaking one JSON object per line.
+
+    The transport is an implementation detail behind ``RunSession`` — it can be swapped for a
+    local service later without changing the public API. It carries NO session logic: it just
+    forwards a command dict and returns the parsed response dict.
+    """
+
+    def __init__(self, binary: Optional[str] = None, timeout: int = 120):
+        self._bin = binary or _find_binary()
+        self._timeout = timeout
+        self._p: Optional[subprocess.Popen] = None
+
+    def start(self) -> None:
+        self._p = subprocess.Popen(
+            [self._bin, "--session"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        )
+
+    def send(self, cmd: dict) -> dict:
+        if self._p is None or self._p.poll() is not None:
+            raise ArkBridgeError("session process is not running")
+        payload = (json.dumps(cmd) + "\n").encode()
+        try:
+            self._p.stdin.write(payload)
+            self._p.stdin.flush()
+            out = self._p.stdout.readline()
+        except (OSError, BrokenPipeError) as e:
+            raise ArkBridgeError(f"session transport failed: {e}") from e
+        if not out:
+            err = (self._p.stderr.read() or b"")[:300].decode(errors="replace")
+            raise ArkBridgeError(f"session ended without a response: {err}")
+        try:
+            data = json.loads(out.decode())
+        except json.JSONDecodeError as e:
+            raise ArkBridgeError(f"session returned non-JSON: {out[:200]!r}") from e
+        if isinstance(data, dict) and data.get("error"):
+            raise ArkBridgeError(data["error"])
+        return data
+
+    def close(self) -> None:
+        if self._p is None:
+            return
+        try:
+            if self._p.stdin and not self._p.stdin.closed:
+                self._p.stdin.close()
+            self._p.wait(timeout=5)
+        except Exception:
+            try:
+                self._p.kill()
+            except Exception:
+                pass
+        finally:
+            self._p = None
+
+
+class RunSession:
+    """A single ARK trace around an external agent's run. Use as a context manager.
+
+    ``supervision="experimental"`` is required to call ``check``; observe-only traces omit it.
+    """
+
+    def __init__(self, task: str, *, task_type: Optional[str] = None, supervision: str = "off",
+                 provider: str = "openai", budget: int = 4, run_id: Optional[str] = None,
+                 transport: Optional[_SessionProc] = None):
+        if supervision not in ("off", "experimental"):
+            raise ValueError("supervision must be 'off' or 'experimental'")
+        self.task = task
+        self.run_id: Optional[str] = run_id
+        self._task_type = task_type
+        self._supervision = supervision
+        self._provider = provider
+        self._budget = budget
+        self._proc = transport or _SessionProc()
+        self._result: Optional[RunResult] = None
+        self._provenance: Optional[dict] = None
+        self._finished = False
+        self._started = False
+
+    # -- lifecycle -----------------------------------------------------------------
+    def __enter__(self) -> "RunSession":
+        self._proc.start()
+        r = self._proc.send({
+            "cmd": "start", "task": self.task, "task_type": self._task_type or "",
+            "supervision": self._supervision, "provider": self._provider,
+            "budget": self._budget, "run_id": self.run_id or "",
+        })
+        self.run_id = r.get("run_id")
+        self._started = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if self._started and not self._finished:
+                self.finish(
+                    success=exc_type is None,
+                    termination_reason=None if exc_type is None else f"exception: {exc_type.__name__}",
+                )
+        finally:
+            self._proc.close()
+        return False  # never suppress the developer's exception
+
+    # -- supervision gate ----------------------------------------------------------
+    def check(self, proposed_action: Any, constraint: str, evidence: dict, *,
+              action: str = "tool_call", tool: Optional[str] = None) -> Verdict:
+        """Gate a proposed action BEFORE executing it. Synchronous, non-authoring.
+
+        Returns a :class:`Verdict`. ARK owns the retry budget and verdict semantics; on a
+        non-ALLOW verdict your agent re-authors the next action and calls ``check`` again.
+        """
+        if not self._started:
+            raise ArkError("check() outside an open trace")
+        if self._supervision != "experimental":
+            raise ArkSupervisionDisabled(
+                "constrained supervision is experimental and off by default; "
+                "open the trace with supervision='experimental'")
+        r = self._proc.send({
+            "cmd": "check", "action": action, "tool": tool or "",
+            "constraint": constraint, "proposed": _as_proposed(proposed_action),
+            "evidence": evidence or {},
+        })
+        return Verdict(r)
+
+    # -- telemetry report ----------------------------------------------------------
+    def record(self, *, action: Optional[str] = None, model: Optional[str] = None,
+               tool: Optional[str] = None, tool_args: Optional[dict] = None,
+               input_tokens: Optional[int] = None, output_tokens: Optional[int] = None,
+               cost: Optional[float] = None, latency_ms: Optional[int] = None,
+               routing_reason: Optional[str] = None, verification: Optional[dict] = None,
+               outcome: Optional[str] = None, executed: bool = True,
+               of: "Verdict | str | None" = None) -> Optional[str]:
+        """Report one decision's telemetry. With ``of=<verdict>`` it completes the decision
+        that ``check`` created; otherwise it records a fresh (unsupervised) decision.
+
+        Everything here is REPORTED by your runtime — ARK derives only ids/ordering and, when
+        you give tokens+model but no ``cost``, the cost (via ARK's pricing tables).
+        """
+        if not self._started:
+            raise ArkError("record() outside an open trace")
+        of_id = of.decision_id if isinstance(of, Verdict) else of
+        r = self._proc.send({
+            "cmd": "record", "action": action or "", "model": model or "",
+            "tool": tool or "", "tool_args": tool_args,
+            "input_tokens": input_tokens or 0, "output_tokens": output_tokens or 0,
+            "cost": cost, "latency_ms": latency_ms or 0,
+            "routing_reason": routing_reason or "", "verification": verification,
+            "outcome": outcome or "", "executed": executed, "of": of_id or "",
+        })
+        return r.get("decision_id")
+
+    def finish(self, *, success: bool = True, termination_reason: Optional[str] = None,
+               output: Optional[str] = None) -> RunResult:
+        """End the trace and return the canonical RunResult. Called automatically on exit."""
+        if self._finished:
+            return self._result  # type: ignore[return-value]
+        r = self._proc.send({
+            "cmd": "finish", "success": success,
+            "termination_reason": termination_reason or "", "output": output or "",
+        })
+        self._result = RunResult.from_dict(r["run_result"])
+        self._provenance = r.get("provenance")
+        self._finished = True
+        return self._result
+
+    # -- results -------------------------------------------------------------------
+    @property
+    def result(self) -> RunResult:
+        if self._result is None:
+            raise ArkError("run result is not available until the trace finishes")
+        return self._result
+
+    @property
+    def provenance(self) -> Optional[dict]:
+        """Per-decision {reported:[...], derived:[...]} split — which facts came from your
+        runtime vs which ARK generated. Available after the trace finishes."""
+        return self._provenance
+
+
+def _as_proposed(p: Any) -> dict:
+    """Accept a bare option id, ``{"option": ...}``, or a full ProposedAction-shaped dict."""
+    if isinstance(p, dict):
+        if "option" in p or "kind" in p or "fields" in p:
+            return p
+        return {"fields": p}
+    return {"option": str(p)}

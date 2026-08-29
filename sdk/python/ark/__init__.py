@@ -6,17 +6,38 @@ intervention records, and (experimental, opt-in) constrained supervision.
 This SDK does not reimplement ARK and makes no unproven claims (e.g. automatic cost
 savings): it exposes the factual telemetry the Go runtime already produces.
 """
+from typing import Optional
+
 from .client import ARK
 from .errors import ArkError, ArkBridgeError, ArkSupervisionDisabled
+from .session import RunSession, Verdict
 from .models import (
     RunResult, DecisionRecord, DecisionCost, SupervisionRecord, SupervisionResult,
     Verification, RoutingDecision, ToolDecision, SupervisionSummary, RoutingSummary, ToolSummary,
 )
 
+
+def trace(task: str, *, supervision: str = "off", task_type: Optional[str] = None,
+          provider: str = "openai", budget: int = 4) -> RunSession:
+    """Open an external-agent trace with a default client. Keep your own agent/model/tools
+    and attach ARK around your runtime:
+
+        import ark
+        with ark.trace("find the top Python web frameworks") as run:
+            ...                                  # your loop reports decisions
+        result = run.result                      # canonical RunResult
+
+    Pass supervision="experimental" to enable run.check(...) gating.
+    """
+    return ARK(supervision=supervision).trace(task, task_type=task_type,
+                                              provider=provider, budget=budget)
+
+
 __all__ = [
-    "ARK", "ArkError", "ArkBridgeError", "ArkSupervisionDisabled",
+    "ARK", "trace", "RunSession", "Verdict",
+    "ArkError", "ArkBridgeError", "ArkSupervisionDisabled",
     "RunResult", "DecisionRecord", "DecisionCost", "SupervisionRecord", "SupervisionResult",
     "Verification", "RoutingDecision", "ToolDecision",
     "SupervisionSummary", "RoutingSummary", "ToolSummary",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

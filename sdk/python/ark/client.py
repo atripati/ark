@@ -19,6 +19,7 @@ from typing import Any, Optional
 from .bridge import SubprocessBridge
 from .errors import ArkSupervisionDisabled
 from .models import RunResult, SupervisionRecord, SupervisionResult
+from .session import RunSession
 
 
 class ARK:
@@ -43,6 +44,22 @@ class ARK:
         if config:
             req["config"] = config
         return RunResult.from_dict(self._bridge.call(req))
+
+    def trace(self, task: str, *, task_type: Optional[str] = None,
+              provider: str = "openai", budget: int = 4) -> RunSession:
+        """Open an external-agent trace: keep your own agent/model/tools and attach ARK
+        around your runtime. Use as a context manager:
+
+            with ark.trace("book the 2nd-cheapest flight") as run:
+                ...                       # your loop
+                run.record(action="tool_call", model="gpt-4o", input_tokens=..., ...)
+            result = run.result           # canonical RunResult
+
+        Supervision follows this client's setting: ARK(supervision="experimental").trace(...)
+        enables run.check(...). ARK never executes your agent — you do.
+        """
+        return RunSession(task, task_type=task_type, supervision=self.supervision,
+                          provider=provider, budget=budget)
 
     def supervise(self, constraint: str, proposed: dict, evidence: dict,
                   retry_count: int = 0, budget: int = 4) -> SupervisionResult:

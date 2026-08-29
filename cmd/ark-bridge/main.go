@@ -1,17 +1,21 @@
 // Command ark-bridge is the isolated Go<->Python bridge for the ARK Runtime SDK.
 //
-// It reads one JSON request on stdin and writes one JSON response on stdout:
+// Two transports share this one binary; both keep the Go runtime as the source of truth.
+//
+// One-shot (default) — reads one JSON request on stdin, writes one JSON response on stdout:
 //
 //	{"kind":"run","task":"..."}            -> canonical telemetry.RunResult JSON
 //	{"kind":"supervise",...}               -> {verdict, supervision} (experimental)
 //
-// The Go runtime remains the source of truth: this bridge only assembles the runtime,
-// runs it, and maps the real result through telemetry.FromTaskResult. It does NOT
-// reimplement routing/supervision/cost/verification. It is a separate binary so it never
-// touches the monolithic runAgent (or any unrelated in-progress work).
+// Session (`ark-bridge --session`) — a persistent, line-delimited request/response loop for
+// EXTERNAL-agent integration (`with ark.trace(...) as run:`). The developer keeps their own
+// agent/model/tools and REPORTS decisions; ARK observes + supervises. Crucially the SESSION
+// STATE lives here in Go, not in Python: the retry counters, verdict semantics, decision
+// registry and telemetry.Builder are all authoritative on this side, so a stateless Python
+// client cannot drift from the real supervision/recovery logic. See session.go.
 //
-// "mode":"mock" (default) exercises the REAL runtime (real agent loop, real router
-// decisions, real cost machinery) with a deterministic model executor, so the SDK is
+// The one-shot "mode":"mock" (default) exercises the REAL runtime (real agent loop, real
+// router decisions, real cost machinery) with a deterministic model executor, so the SDK is
 // reproducible with no API cost. "mode":"live" loads agent.yaml and uses the configured
 // provider. The transport (subprocess) is an implementation detail behind the Python API.
 package main
@@ -23,8 +27,8 @@ import (
 	"os"
 	"time"
 
-	ctx "github.com/atripati/ark/pkg/context"
 	"github.com/atripati/ark/pkg/config"
+	ctx "github.com/atripati/ark/pkg/context"
 	"github.com/atripati/ark/pkg/models"
 	"github.com/atripati/ark/pkg/router"
 	"github.com/atripati/ark/pkg/runtime"
@@ -48,6 +52,16 @@ type request struct {
 }
 
 func main() {
+	for _, a := range os.Args[1:] {
+		if a == "--session" {
+			runSession() // persistent external-agent session (see session.go)
+			return
+		}
+	}
+	runOneShot()
+}
+
+func runOneShot() {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		emitErr("read stdin: " + err.Error())

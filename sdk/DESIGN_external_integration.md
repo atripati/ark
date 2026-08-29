@@ -180,3 +180,29 @@ production paths (ARK's agent, or an external agent reporting through the sessio
 No LangGraph / CrewAI / OpenAI-Agents adapter, no `ark.wrap()` implementation, no dashboards
 / cloud / auth / billing, no new validators, no cost optimization. Those are downstream of
 this generic session interface.
+
+## Status: implemented (generic `trace` session)
+
+The generic session is built and tested; framework adapters and `wrap()` remain deferred.
+
+- **Transport** — one persistent local process, `ark-bridge --session`, speaking one compact
+  JSON object per line (commands: `start` / `check` / `record` / `finish`). This is how the
+  session keeps state **authoritative in Go**: `cmd/ark-bridge/session.go` holds the retry
+  counters, the decision registry, and the `telemetry.Builder`; Python never counts retries
+  or re-derives verdicts. The one-shot bridge (`ark.run` / `ark.supervise`) is unchanged.
+- **Python** — `ark/session.py` (`RunSession`, `Verdict`), surfaced as `ark.trace(...)` /
+  `ARK(...).trace(...)`. `check(proposed_action, constraint, evidence, ...)`; `record(...,
+  of=verdict)` links execution telemetry to the checked proposal via the verdict's stable
+  `decision_id`; the context manager finishes the run (or, on an exception, finishes it
+  unsuccessful) and exposes `run.result` + `run.provenance`.
+- **Provenance** — every decision carries a `{reported, derived}` split so developer-reported
+  model/token/tool/latency facts are never presented as ARK-observed; cost is marked *derived*
+  when ARK computed it from reported tokens+model (and left alone when the developer supplied
+  it). External provider status is reported as `"reported"`, never `"configured"`.
+- **Proven chain** — `examples/external_supervised.py` and the Go/Python tests exercise the
+  full sequence `start → check(REJECT, suggested) → check(ALLOW) → record(of=v) → finish` and
+  assert the resulting canonical `RunResult` contains the complete proposal → supervision →
+  retry → execution → outcome → cost chain, with a rejected proposal recorded as
+  not-executed / zero-cost. `examples/external_observe.py` covers the observe-only path.
+- **Unchanged** — telemetry contract (`pkg/telemetry`), supervision engine (`pkg/supervise`),
+  routing, and cost accounting (`pkg/cost`) are reused, not modified.
