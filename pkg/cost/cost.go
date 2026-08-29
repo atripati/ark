@@ -56,16 +56,65 @@ var priceTable = map[string]TokenPrice{
 	},
 }
 
-func ModelPricing(provider, model string) TokenPrice {
+// lookupPricing reports whether the model is actually known to the price table.
+// This distinction matters: an unknown model must NOT silently price at zero, or
+// cost is understated. Callers that have a fallback should use this and prefer
+// the fallback when ok is false.
+func lookupPricing(provider, model string) (TokenPrice, bool) {
 	key := strings.ToLower(provider) + "/" + strings.ToLower(model)
 	if p, ok := priceTable[key]; ok {
-		return p
+		return p, true
 	}
-
-	for k, p := range priceTable {
-		if strings.HasPrefix(key, k) || strings.HasPrefix(k, key) {
-			return p
+	// Deterministic resolution — never depend on map iteration order. A versioned or
+	// snapshot name can prefix-match several base entries (e.g. gpt-4o-mini-2024-07-18
+	// matches both gpt-4o and gpt-4o-mini). Prefer the LONGEST base entry that is a
+	// segment-boundary prefix of the queried name, so a snapshot resolves to its own base
+	// model, never a shorter sibling.
+	best, bestLen := "", -1
+	for k := range priceTable {
+		if isModelPrefix(k, key) && len(k) > bestLen {
+			best, bestLen = k, len(k)
 		}
+	}
+	if bestLen >= 0 {
+		return priceTable[best], true
+	}
+	// Reverse: a base name may map to a single snapshot entry (e.g. claude-sonnet-4 ->
+	// claude-sonnet-4-20250514). Pick the lexicographically smallest match so the result
+	// is stable regardless of map order.
+	rev := ""
+	for k := range priceTable {
+		if isModelPrefix(key, k) && (rev == "" || k < rev) {
+			rev = k
+		}
+	}
+	if rev != "" {
+		return priceTable[rev], true
+	}
+	return TokenPrice{}, false
+}
+
+// isModelPrefix reports whether short is a segment-boundary prefix of full: they are equal,
+// or full continues after short at a version boundary ('-', ':', '/'). The boundary check
+// stops gpt-4o from matching gpt-4o-mini, and llama3 from matching llama3.2.
+func isModelPrefix(short, full string) bool {
+	if short == full {
+		return true
+	}
+	if !strings.HasPrefix(full, short) {
+		return false
+	}
+	switch full[len(short)] {
+	case '-', ':', '/':
+		return true
+	default:
+		return false
+	}
+}
+
+func ModelPricing(provider, model string) TokenPrice {
+	if p, ok := lookupPricing(provider, model); ok {
+		return p
 	}
 	return TokenPrice{
 		Provider: provider, Model: model,
@@ -102,6 +151,7 @@ type StepCost struct {
 	TotalCost    float64       `json:"total_cost"`  // US dollar
 	Latency      time.Duration `json:"latency_ms"`
 	CostPerMs    float64       `json:"cost_per_ms"`
+	Model        string        `json:"model,omitempty"` // model this step was priced against
 }
 
 type CostReport struct {
@@ -160,17 +210,44 @@ func (t *Tracker) SetTaskID(taskID string) {
 	t.taskID = taskID
 }
 
+// RecordStep records a step priced at the tracker's default (configured) model.
+// Prefer RecordStepWithModel when the model that actually ran the step is known:
+// with per-step routing the configured model is frequently NOT the model used,
+// and pricing every step at the configured rate misreports cost — usually by
+// overstating it, which hides the savings routing actually produced.
 func (t *Tracker) RecordStep(step int, inputTokens, outputTokens int, action, toolName string, latency time.Duration) StepCost {
+	return t.RecordStepWithModel(step, inputTokens, outputTokens, action, toolName, latency, "", "")
+}
+
+// RecordStepWithModel records a step priced at the model that actually executed
+// it. An empty model falls back to the tracker's configured pricing.
+func (t *Tracker) RecordStepWithModel(step int, inputTokens, outputTokens int, action, toolName string, latency time.Duration, provider, model string) StepCost {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	inputCost := float64(inputTokens) * t.pricing.InputPerToken
-	outputCost := float64(outputTokens) * t.pricing.OutputPerToken
+	pricing := t.pricing
+	if model != "" {
+		if p, ok := lookupPricing(provider, model); ok {
+			pricing = p
+		}
+	}
+
+	inputCost := float64(inputTokens) * pricing.InputPerToken
+	outputCost := float64(outputTokens) * pricing.OutputPerToken
 	totalCost := inputCost + outputCost
 
 	costPerMs := 0.0
 	if latency.Milliseconds() > 0 {
 		costPerMs = totalCost / float64(latency.Milliseconds())
+	}
+
+	// A step that consumed no tokens involved no model call — a refusal recorded
+	// before the loop, for instance. Stamping a model name on it would manufacture
+	// an attribution for a call that never happened, and every downstream label is
+	// derived from this field.
+	stepModel := ""
+	if inputTokens > 0 || outputTokens > 0 {
+		stepModel = pricing.DisplayName
 	}
 
 	sc := StepCost{
@@ -184,6 +261,7 @@ func (t *Tracker) RecordStep(step int, inputTokens, outputTokens int, action, to
 		TotalCost:    totalCost,
 		Latency:      latency,
 		CostPerMs:    costPerMs,
+		Model:        stepModel,
 	}
 
 	t.steps = append(t.steps, sc)
@@ -217,13 +295,44 @@ func (t *Tracker) BudgetRemaining() float64 {
 	return remaining
 }
 
+// modelLabel names the model(s) the task actually ran on. With per-step routing
+// a task commonly spans two models; reporting only the configured one would
+// misdescribe what happened. Caller must hold t.mu.
+func (t *Tracker) modelLabel() string {
+	seen := make(map[string]bool)
+	var models []string
+	for _, sc := range t.steps {
+		// A step that consumed no tokens involved no model call and must not
+		// contribute a model name. This matters because a run refused before any
+		// call still records one step explaining the refusal, and because every
+		// step carries a Model field regardless — it is set from whichever
+		// pricing was applied, falling back to the configured model. So the
+		// presence of a model name is not evidence a model ran; token usage is.
+		if sc.InputTokens == 0 && sc.OutputTokens == 0 {
+			continue
+		}
+		if sc.Model != "" && !seen[sc.Model] {
+			seen[sc.Model] = true
+			models = append(models, sc.Model)
+		}
+	}
+	switch len(models) {
+	case 0:
+		return "none"
+	case 1:
+		return models[0]
+	default:
+		return strings.Join(models, " + ") + " (routed)"
+	}
+}
+
 func (t *Tracker) Report() *CostReport {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	report := &CostReport{
 		TaskID:       t.taskID,
-		Model:        t.pricing.DisplayName,
+		Model:        t.modelLabel(),
 		Attribution:  t.attribution,
 		Steps:        make([]StepCost, len(t.steps)),
 		CostByAction: make(map[string]float64),
