@@ -46,3 +46,7 @@ ark-bridge-test-bin
 *.env
 dist/
 build/
+*.whl
+# bundled bridge binary is built at packaging time, not committed
+sdk/python/ark/_bridge/ark-bridge
+sdk/python/ark/_bridge/ark-bridge.exe

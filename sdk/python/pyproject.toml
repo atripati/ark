@@ -1,18 +1,37 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=70", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ark-runtime-sdk"
-version = "0.2.0"
-description = "Python SDK for the ARK runtime (execution, decision traces, cost attribution, routing, experimental constrained supervision)."
+name = "ark-runtime"
+version = "0.1.0a1"
+description = "ARK Runtime SDK — attach ARK decision telemetry, cost attribution, and (experimental) constrained supervision around your existing agent."
+readme = "README.md"
 requires-python = ">=3.9"
+license = "LicenseRef-Proprietary"
+authors = [{ name = "Abhishek Tripathi" }]
+keywords = ["ark", "agent", "llm", "telemetry", "cost", "supervision", "observability", "langgraph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = []
 
-# The core SDK has no runtime deps. Framework integrations are opt-in extras and are
-# imported lazily, so `import ark` never requires them.
+# The core SDK has no runtime deps. Framework integrations are opt-in extras and are imported
+# lazily, so `import ark` never requires them.
 [project.optional-dependencies]
 langgraph = ["langgraph>=0.2", "langchain-core>=0.3"]
 
+[project.urls]
+Homepage = "https://github.com/atripati/ark"
+Repository = "https://github.com/atripati/ark"
+
 [tool.setuptools.packages.find]
 include = ["ark*"]
+
+# The bundled platform bridge binary ships as package data (built at release time).
+[tool.setuptools.package-data]
+"ark._bridge" = ["ark-bridge", "ark-bridge.exe"]

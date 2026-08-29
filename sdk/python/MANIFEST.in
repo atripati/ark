@@ -1,0 +1,9 @@
+# Wheels ship only the `ark` package (+ its bundled bridge via package-data). This keeps any
+# source distribution equally clean: no tests, examples, build scripts, or binaries.
+include README.md
+prune tests
+prune examples
+exclude build_wheel.sh
+global-exclude *.pyc __pycache__/* .DS_Store
+# the platform binary is a per-platform build artifact — never in an sdist
+recursive-exclude ark/_bridge ark-bridge ark-bridge.exe

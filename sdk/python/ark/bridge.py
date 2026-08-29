@@ -14,19 +14,47 @@ import subprocess
 from .errors import ArkBridgeError
 
 
+def _bundled_binary() -> "str | None":
+    """The bridge shipped inside the installed wheel (ark/_bridge/ark-bridge[.exe])."""
+    name = "ark-bridge.exe" if os.name == "nt" else "ark-bridge"
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bridge", name)
+    return p if os.path.isfile(p) else None
+
+
+def _ensure_executable(path: str) -> None:
+    """Wheels don't always preserve the +x bit for package data; restore it if missing."""
+    if os.name == "nt":
+        return
+    try:
+        mode = os.stat(path).st_mode
+        if not (mode & 0o111):
+            os.chmod(path, mode | 0o111)
+    except OSError:
+        pass
+
+
 def _find_binary() -> str:
+    # 1. explicit override — for developers/debugging (not needed by an installed package)
     b = os.environ.get("ARK_BRIDGE_BIN")
     if b and os.path.exists(b):
         return b
+    # 2. the bundled bridge inside the installed wheel — the normal path, zero setup
+    bundled = _bundled_binary()
+    if bundled:
+        _ensure_executable(bundled)
+        return bundled
+    # 3. a bridge on PATH, then a source-checkout build (developer convenience)
     p = shutil.which("ark-bridge")
     if p:
         return p
-    for guess in (os.path.expanduser("~/ark/ark-bridge-bin"),):
+    for guess in (os.path.expanduser("~/ark/ark-bridge-bin"),
+                  os.path.expanduser("~/ark/ark-bridge-test-bin")):
         if os.path.exists(guess):
             return guess
     raise ArkBridgeError(
-        "ark-bridge binary not found. Build it with `go build -o ark-bridge-bin ./cmd/ark-bridge` "
-        "and set ARK_BRIDGE_BIN, or put `ark-bridge` on PATH."
+        "ark-bridge binary not found. An installed `ark-runtime` wheel bundles it "
+        "automatically; if you are running from a source checkout, build it with "
+        "`go build -o ark-bridge-bin ./cmd/ark-bridge` and set ARK_BRIDGE_BIN."
     )
 
 
