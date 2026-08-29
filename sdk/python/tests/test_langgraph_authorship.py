@@ -24,10 +24,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
 
 import ark
-from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool
+from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool, build_agent
 
 BOOKED: List[str] = []
 
@@ -90,7 +89,7 @@ def test_model_authors_recovery_ark_never_forces_its_suggestion():
     probe = _Probe()
     with ark.ARK(supervision="experimental").trace(task="book", provider="openai", budget=5) as run:
         supervised = ark_supervise_tool(run, book_flight, constraint="rank", evidence=EV)
-        agent = create_react_agent(_ScriptModel(["A", "C", "B"]), [supervised])
+        agent = build_agent(_ScriptModel(["A", "C", "B"]), [supervised])
         agent.invoke({"messages": [("user", "book one")]},
                      config={"callbacks": [ArkCallbackHandler(run, record_tools=False), probe]})
     r = run.result
@@ -123,16 +122,16 @@ def test_rejected_proposal_returns_feedback_string_not_execution():
 def test_removing_ark_leaves_agent_runnable():
     """Provider independence: the SAME agent with NO ARK (no callbacks, no wrapper) still runs."""
     BOOKED.clear()
-    agent = create_react_agent(_ScriptModel(["B"]), [book_flight])   # raw tool, no ARK
+    agent = build_agent(_ScriptModel(["B"]), [book_flight])   # raw tool, no ARK
     out = agent.invoke({"messages": [("user", "book B")]})           # no ARK callbacks
     assert out["messages"][-1].content == "done"
     assert BOOKED == ["B"]                                           # ran fine without ARK
 
 
 def test_tool_failure_is_represented_in_trace():
-    """A tool that raises surfaces in the canonical trace via outcome='error: ...' (not a
-    silent success). NOTE: the dedicated DecisionRecord.error field stays empty because the
-    frozen record() API carries no error param — reported, not redesigned."""
+    """A tool that raises surfaces in the canonical trace: the dedicated `error` field is
+    populated (and aggregates into RunResult.errors) AND `outcome` is preserved for compat.
+    (Full end-to-end aggregation is covered in test_error_propagation.py.)"""
     spy_records = []
     class Spy:
         def record(self, **kw): spy_records.append(kw); return "d"
@@ -140,7 +139,7 @@ def test_tool_failure_is_represented_in_trace():
     h.on_tool_start({"name": "book_flight"}, "{}", run_id="t1", inputs={"option": "A"})
     h.on_tool_error(RuntimeError("db down"), run_id="t1")
     assert spy_records and spy_records[0]["outcome"].startswith("error:")
-    assert "RuntimeError" in spy_records[0]["outcome"]
+    assert "RuntimeError" in spy_records[0]["error"]        # dedicated field now populated
 
 
 def test_model_error_is_represented_in_trace():
@@ -151,3 +150,4 @@ def test_model_error_is_represented_in_trace():
     h.on_chat_model_start({"name": "ChatOpenAI"}, [[]], run_id="m1")
     h.on_llm_error(TimeoutError("upstream timeout"), run_id="m1")
     assert spy_records[0]["outcome"].startswith("error:") and spy_records[0]["executed"] is False
+    assert "TimeoutError" in spy_records[0]["error"]        # dedicated field now populated

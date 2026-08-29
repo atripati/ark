@@ -19,10 +19,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
 
 import ark
-from ark.integrations.langgraph import ArkCallbackHandler
+from ark.integrations.langgraph import ArkCallbackHandler, build_agent
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -60,7 +59,7 @@ def search_frameworks(query: str) -> str:
 
 
 def main():
-    agent = create_react_agent(ScriptedChatModel(), [search_frameworks])
+    agent = build_agent(ScriptedChatModel(), [search_frameworks])
     with ark.trace(task="find the top Python web frameworks", task_type="ranking") as run:
         agent.invoke({"messages": [("user", "top python web frameworks?")]},
                      config={"callbacks": [ArkCallbackHandler(run)]})

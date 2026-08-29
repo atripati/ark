@@ -174,13 +174,15 @@ class RunSession:
                input_tokens: Optional[int] = None, output_tokens: Optional[int] = None,
                cost: Optional[float] = None, latency_ms: Optional[int] = None,
                routing_reason: Optional[str] = None, verification: Optional[dict] = None,
-               outcome: Optional[str] = None, executed: bool = True,
-               of: "Verdict | str | None" = None) -> Optional[str]:
+               outcome: Optional[str] = None, error: Optional[str] = None,
+               executed: bool = True, of: "Verdict | str | None" = None) -> Optional[str]:
         """Report one decision's telemetry. With ``of=<verdict>`` it completes the decision
         that ``check`` created; otherwise it records a fresh (unsupervised) decision.
 
         Everything here is REPORTED by your runtime — ARK derives only ids/ordering and, when
-        you give tokens+model but no ``cost``, the cost (via ARK's pricing tables).
+        you give tokens+model but no ``cost``, the cost (via ARK's pricing tables). Pass
+        ``error`` for a real failure: it populates the canonical DecisionRecord.error field
+        (aggregated into RunResult.errors); ``outcome`` is kept separately for compatibility.
         """
         if not self._started:
             raise ArkError("record() outside an open trace")
@@ -191,7 +193,8 @@ class RunSession:
             "input_tokens": input_tokens or 0, "output_tokens": output_tokens or 0,
             "cost": cost, "latency_ms": latency_ms or 0,
             "routing_reason": routing_reason or "", "verification": verification,
-            "outcome": outcome or "", "executed": executed, "of": of_id or "",
+            "outcome": outcome or "", "error": error or "",
+            "executed": executed, "of": of_id or "",
         })
         return r.get("decision_id")
 

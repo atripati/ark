@@ -20,10 +20,9 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 
 import ark
-from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool
+from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool, build_agent
 
 MODEL = os.environ.get("ARK_LIVE_MODEL", "gpt-4o-mini")
 _BOOKED = []
@@ -53,7 +52,7 @@ class _Authorship(BaseCallbackHandler):
 
 def test_live_observe_real_model_real_tool():
     model = ChatOpenAI(model=MODEL, temperature=0)          # the app owns the model call
-    agent = create_react_agent(model, [word_count])
+    agent = build_agent(model, [word_count])
     task = ("How many words are in: 'the quick brown fox jumps over the lazy dog'? "
             "Use the word_count tool.")
     with ark.trace(task=task, task_type="tool_use", provider="openai") as run:
@@ -86,7 +85,7 @@ def test_live_supervised_reject_then_model_replans_then_allow():
     with ark.ARK(supervision="experimental").trace(task="book (ARK rank-2 policy)",
                                                    task_type="booking", provider="openai") as run:
         supervised = ark_supervise_tool(run, book_flight, constraint="rank", evidence=ev)
-        agent = create_react_agent(model, [supervised])
+        agent = build_agent(model, [supervised])
         task = ("Book me the CHEAPEST available flight. Options: A costs $163, B costs $290, "
                 "C costs $410. Call book_flight with the option id.")
         agent.invoke({"messages": [("user", task)]},

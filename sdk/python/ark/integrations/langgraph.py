@@ -30,8 +30,16 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.tools import BaseTool, StructuredTool
+try:
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.tools import BaseTool, StructuredTool
+except ModuleNotFoundError as e:  # optional dependency — give a clear, actionable message
+    raise ImportError(
+        "ARK's LangGraph integration requires the optional 'langgraph' extra. "
+        "Install it with:  pip install 'ark-runtime-sdk[langgraph]'  "
+        "(or:  pip install langgraph langchain-core ). "
+        "The core ARK SDK (import ark) does not need it."
+    ) from e
 
 from ..session import RunSession, Verdict
 
@@ -92,7 +100,7 @@ class ArkCallbackHandler(BaseCallbackHandler):
         latency_ms = _elapsed_ms(self._llm_start.pop(run_id, None))
         self._run.record(action="model_call", model=self._llm_model.pop(run_id, None),
                          latency_ms=latency_ms, outcome=f"error: {type(error).__name__}",
-                         executed=False)
+                         error=_err(error), executed=False)
 
     # ---- tool executions -> tool-activity decisions (no token cost) ----
     def on_tool_start(self, serialized, input_str, *, run_id, inputs=None, **kwargs):
@@ -116,7 +124,27 @@ class ArkCallbackHandler(BaseCallbackHandler):
         name, args = self._tool_meta.pop(run_id, ("tool", None))
         latency_ms = _elapsed_ms(self._tool_start.pop(run_id, None))
         self._run.record(action="tool_call", tool=name, tool_args=args, latency_ms=latency_ms,
-                         outcome=f"error: {type(error).__name__}")
+                         outcome=f"error: {type(error).__name__}", error=_err(error))
+
+
+def build_agent(model: Any, tools: Any, **kwargs) -> Any:
+    """Construct a LangGraph ReAct-style agent using the SUPPORTED constructor for the
+    installed version — ``langchain.agents.create_agent`` (LangGraph/LangChain 1.x) when
+    available, else ``langgraph.prebuilt.create_react_agent`` (older, deprecation silenced).
+
+    This is only a convenience so callers avoid the deprecation churn; ARK's observation and
+    supervision hooks work identically with either constructor (verified). It builds nothing
+    ARK-specific — the returned agent is a plain LangGraph graph you invoke yourself.
+    """
+    try:
+        from langchain.agents import create_agent  # LangChain 1.x, the supported path
+        return create_agent(model, tools, **kwargs)
+    except ModuleNotFoundError:
+        import warnings
+        from langgraph.prebuilt import create_react_agent
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # its own move-to-langchain deprecation notice
+            return create_react_agent(model, tools, **kwargs)
 
 
 def ark_supervise_tool(run: RunSession, tool: Any, *, constraint: str,
@@ -144,7 +172,13 @@ def ark_supervise_tool(run: RunSession, tool: Any, *, constraint: str,
         verdict: Verdict = run.check(proposed_action=prop, constraint=constraint,
                                      evidence=ev or {}, action="tool_call", tool=name)
         if verdict.allowed:
-            result = raw(**kwargs)
+            try:
+                result = raw(**kwargs)
+            except Exception as exc:  # a supervised action that was allowed but then failed
+                run.record(action="tool_call", tool=name, tool_args=kwargs,
+                           outcome=f"error: {type(exc).__name__}", error=_err(exc),
+                           executed=True, of=verdict)
+                raise  # let LangGraph handle the tool error natively
             run.record(action="tool_call", tool=name, tool_args=kwargs,
                        outcome="success", of=verdict)
             return result
@@ -159,6 +193,20 @@ def ark_supervise_tool(run: RunSession, tool: Any, *, constraint: str,
 
 
 # ---- helpers (pure mapping over LangChain event shapes; no ARK logic) ----
+
+import re as _re
+
+# scrub obvious secret shapes from an error string so a provider error can never leak a key.
+_SECRET_RE = _re.compile(
+    r"(sk-[A-Za-z0-9_\-]{6,}|ghp_[A-Za-z0-9]{6,}|Bearer\s+[A-Za-z0-9._\-]{6,}|"
+    r"api[_-]?key\s*[=:]\s*\S+)", _re.IGNORECASE)
+
+
+def _err(exc: BaseException, limit: int = 300) -> str:
+    """A compact, secret-scrubbed error string for the canonical DecisionRecord.error field."""
+    msg = _SECRET_RE.sub("[redacted]", str(exc))[:limit]
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
 
 def _default_proposed(args: dict) -> dict:
     for v in args.values():

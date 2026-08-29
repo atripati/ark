@@ -21,10 +21,9 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 
 import ark
-from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool
+from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool, build_agent
 
 MODEL = os.environ.get("ARK_LIVE_MODEL", "gpt-4o-mini")
 
@@ -72,7 +71,7 @@ def main():
     with ark.ARK(supervision="experimental").trace(task="book a flight (ARK enforces rank-2 policy)",
                                                    task_type="booking", provider="openai") as run:
         supervised_book = ark_supervise_tool(run, book_flight, constraint="rank", evidence=EVIDENCE)
-        agent = create_react_agent(model, [supervised_book])
+        agent = build_agent(model, [supervised_book])
         task = ("Book me the CHEAPEST available flight. Options: A costs $163, B costs $290, "
                 "C costs $410. Call book_flight with the option id.")
         out = agent.invoke({"messages": [("user", task)]},

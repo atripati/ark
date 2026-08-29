@@ -49,8 +49,24 @@ A supervised turn therefore surfaces as: model decision (cost) → tool decision
 model decision — the full proposal → supervision → retry → execution → outcome → cost chain
 in one canonical `RunResult`.
 
+## Errors
+
+Real failures populate the canonical `DecisionRecord.error` field (aggregated into
+`RunResult.errors`); `outcome` is preserved as `"error: <Type>"` for compatibility. Covered:
+model/provider failure (`on_llm_error`), tool failure (`on_tool_error`), and a supervised
+tool that is allowed but then raises (the wrapper records the error and re-raises so
+LangGraph handles it natively). A successful run gains no false errors. Error strings are
+secret-scrubbed before they enter the trace.
+
+## Agent construction across versions
+
+Use `build_agent(model, tools)` from this module to avoid the LangGraph 1.0 deprecation: it
+calls `langchain.agents.create_agent` when available, else `langgraph.prebuilt.create_react_agent`
+(warning silenced). ARK's observation and supervision hooks are verified identical on both.
+
 ## Scope / limits
 
 Sync graphs (`.invoke(...)`); async/parallel tool fan-out is out of scope. The core SDK has
-no dependency on LangGraph — the integration is imported lazily and installed via the extra
-`pip install ark-runtime-sdk[langgraph]`. No CrewAI / OpenAI-Agents adapter, no `wrap()`.
+no dependency on LangGraph — the integration is imported lazily (a clear install message if
+the extra is missing) and installed via `pip install 'ark-runtime-sdk[langgraph]'`. No
+CrewAI / OpenAI-Agents adapter, no `wrap()`.

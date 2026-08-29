@@ -36,3 +36,13 @@ __pycache__/
 *.egg-info/
 *.db-shm
 *.db-wal
+
+# Local build artifacts & environments — never commit or ship (secrets / binaries)
+ark-bridge-bin
+ark-bridge-test-bin
+.venv/
+.venv-live/
+.env
+*.env
+dist/
+build/

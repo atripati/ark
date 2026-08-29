@@ -24,10 +24,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
 
 import ark
-from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool, _llm_end_fields
+from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool, _llm_end_fields, build_agent
 
 
 def approx(a, b):
@@ -147,7 +146,7 @@ class _ScriptedModel(BaseChatModel):
 
 
 def test_end_to_end_observe_runresult_and_cost_reconcile():
-    agent = create_react_agent(_ScriptedModel(), [book_flight])
+    agent = build_agent(_ScriptedModel(), [book_flight])
     with ark.trace(task="book a flight", task_type="booking") as run:
         agent.invoke({"messages": [("user", "book it")]},
                      config={"callbacks": [ArkCallbackHandler(run)]})
@@ -194,7 +193,7 @@ def test_end_to_end_supervised_full_chain():
                       {"id": "B", "price": 290, "is_direct": True}]}
     with ark.ARK(supervision="experimental").trace(task="book 2nd-cheapest", task_type="booking") as run:
         supervised = ark_supervise_tool(run, book_flight, constraint="rank", evidence=ev)
-        agent = create_react_agent(_ReplanModel(), [supervised])
+        agent = build_agent(_ReplanModel(), [supervised])
         agent.invoke({"messages": [("user", "book the 2nd cheapest")]},
                      config={"callbacks": [ArkCallbackHandler(run, record_tools=False)]})
     r = run.result

@@ -18,10 +18,9 @@ warnings.filterwarnings("ignore")
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 
 import ark
-from ark.integrations.langgraph import ArkCallbackHandler
+from ark.integrations.langgraph import ArkCallbackHandler, build_agent
 
 MODEL = os.environ.get("ARK_LIVE_MODEL", "gpt-4o-mini")
 
@@ -38,7 +37,7 @@ def main():
 
     # The LangGraph APPLICATION owns the OpenAI client/key/model call — not ARK.
     model = ChatOpenAI(model=MODEL, temperature=0)   # reads OPENAI_API_KEY from env itself
-    agent = create_react_agent(model, [word_count])
+    agent = build_agent(model, [word_count])
 
     task = ("How many words are in this sentence: "
             "'the quick brown fox jumps over the lazy dog'? Use the word_count tool.")

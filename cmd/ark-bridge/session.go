@@ -60,6 +60,7 @@ type sessionCmd struct {
 	RoutingReason string          `json:"routing_reason"`
 	Verification  *verificationIn `json:"verification"`
 	Outcome       string          `json:"outcome"`
+	Error         string          `json:"error"` // populates the canonical DecisionRecord.error
 	Executed      *bool           `json:"executed"`
 	Of            string          `json:"of"` // decision_NNN this telemetry completes
 
@@ -248,6 +249,12 @@ func (s *extSession) record(c sessionCmd) map[string]any {
 	if c.Outcome != "" {
 		rec.Outcome = c.Outcome
 		rep("outcome")
+	}
+	// A real failure populates the dedicated canonical error field (aggregated into
+	// RunResult.errors by the Builder). Outcome is preserved separately for compatibility.
+	if c.Error != "" {
+		rec.Error = c.Error
+		rep("error")
 	}
 	executed := true
 	if c.Executed != nil {

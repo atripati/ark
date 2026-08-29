@@ -22,10 +22,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent
 
 import ark
-from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool
+from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool, build_agent
 
 # trusted runtime evidence the agent's own search produced (prices; rank 2 = "B").
 EVIDENCE = {"requested_rank": 2, "evidence_complete": True,
@@ -77,7 +76,7 @@ def main():
     with ark.ARK(supervision="experimental").trace(task="book the 2nd-cheapest flight",
                                                    task_type="booking") as run:
         supervised_book = ark_supervise_tool(run, book_flight, constraint="rank", evidence=EVIDENCE)
-        agent = create_react_agent(ReplanModel(), [supervised_book])
+        agent = build_agent(ReplanModel(), [supervised_book])
         # record_tools=False: the wrapped tool records its own (supervised) decisions
         agent.invoke({"messages": [("user", "book the 2nd cheapest flight")]},
                      config={"callbacks": [ArkCallbackHandler(run, record_tools=False)]})
