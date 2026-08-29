@@ -77,6 +77,9 @@ func main() {
 	case "init":
 		runInit()
 
+	case "supervise":
+		runSupervise()
+
 	case "help", "--help", "-h":
 		printUsage()
 
