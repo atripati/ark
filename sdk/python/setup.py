@@ -2,8 +2,17 @@
 
 The package bundles a standalone Go bridge binary — native to the platform, but usable from
 ANY Python 3 (it is a subprocess, not a C extension). So the wheel must be platform-specific
-yet ABI-independent: `py3-none-<platform>` (e.g. py3-none-macosx_15_0_arm64), not cp3x-*.
+yet ABI-independent: `py3-none-<platform>` (e.g. py3-none-macosx_12_0_arm64), not cp3x-*.
+
+The macOS floor in the tag must match the bundled binary's ACTUAL minimum OS (its Mach-O
+`minos`), not the macOS version the building Python happened to be compiled against
+(homebrew Python reports 15.0). A Go 1.26 darwin/arm64 binary has minos 12.0 (Go dropped
+macOS 11), so the honest floor is 12.0 — this covers macOS 12–15, versus the needlessly
+narrow 15.0 that sysconfig would otherwise stamp. Override with ARK_MACOS_MIN only when the
+bundled binary is actually built for a different floor (e.g. an older Go for 11.0).
 """
+import os
+
 from setuptools import setup
 
 try:  # setuptools >= 70 vendors bdist_wheel
@@ -19,6 +28,13 @@ class bdist_wheel(_bdist_wheel):
 
     def get_tag(self):
         _python, _abi, plat = super().get_tag()
+        # Pin the macOS version component to the bundled binary's real floor (must be <= the
+        # binary's minos, verified at build time). Default 12.0 = the Go 1.26 arm64 floor.
+        target = os.environ.get("ARK_MACOS_MIN", "12.0")
+        if plat.startswith("macosx_"):
+            arch = plat.rsplit("_", 1)[-1]
+            major, _, minor = target.partition(".")
+            plat = f"macosx_{major}_{minor or '0'}_{arch}"
         return "py3", "none", plat  # any Python 3, no ABI lock, this platform only
 
 

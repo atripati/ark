@@ -32,6 +32,18 @@ echo ">> building bridge for $GOOS/$GOARCH -> ark/_bridge/$BIN_NAME"
     go build -trimpath -ldflags="-s -w" -o "$OUT" ./cmd/ark-bridge )
 chmod +x "$OUT" 2>/dev/null || true
 
+# On macOS, the wheel advertises ARK_MACOS_MIN (default 12.0, see setup.py). Verify the
+# binary's real Mach-O floor is not NEWER than that, so we never advertise support we lack.
+if [ "$GOOS" = "darwin" ] && command -v otool >/dev/null 2>&1; then
+  MINOS=$(otool -l "$OUT" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+  WANT="${ARK_MACOS_MIN:-12.0}"
+  echo ">> bridge minos=$MINOS ; wheel will advertise macOS $WANT"
+  # numeric compare major.minor; fail if binary needs newer than advertised
+  awk -v b="$MINOS" -v w="$WANT" 'BEGIN{split(b,B,".");split(w,W,".");
+    if (B[1]>W[1] || (B[1]==W[1] && B[2]>W[2])) {exit 1}}' \
+    || { echo "!! binary requires macOS $MINOS but wheel would advertise $WANT — set ARK_MACOS_MIN=$MINOS"; exit 1; }
+fi
+
 echo ">> building wheel"
 ( cd "$HERE" && rm -rf build dist *.egg-info && "$PY" -m build --wheel )
 
