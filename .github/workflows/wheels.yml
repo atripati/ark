@@ -1,8 +1,6 @@
 name: build-wheels
 
-# Builds and TESTS the five platform wheels from clean committed source, then uploads them
-# only as downloadable CI artifacts. This workflow deliberately does NOT publish anywhere:
-# no TestPyPI, no PyPI, no GitHub Release, no credentials. Publishing is done manually later.
+# builds + tests the 5 platform wheels. only builds artifacts, never publishes.
 
 on:
   push:
@@ -31,13 +29,14 @@ jobs:
           - { name: linux-arm64,    runner: ubuntu-24.04-arm, goos: linux,   goarch: arm64, plat: manylinux2014_aarch64, langgraph: false }
           - { name: windows-x86_64, runner: windows-latest,   goos: windows, goarch: amd64, langgraph: true  }
     steps:
-      - uses: actions/checkout@v4          # clean committed source only
+      - uses: actions/checkout@v7          # committed source only
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          cache: false                     # no go.sum yet, skip cache
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -73,7 +72,7 @@ jobs:
       - name: Build the wheel
         working-directory: sdk/python
         env:
-          ARK_WHEEL_PLAT: ${{ matrix.plat }}   # empty on macOS/Windows (defaults are correct)
+          ARK_WHEEL_PLAT: ${{ matrix.plat }}   # linux only; mac/windows use the default tag
         run: |
           set -euo pipefail
           rm -rf build dist
@@ -92,7 +91,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then PY="$RUNNER_TEMP/fresh/Scripts/python"; else PY="$RUNNER_TEMP/fresh/bin/python"; fi
           "$PY" -m pip install --quiet "$WHEEL"
           cp sdk/python/tests/fresh_install_check.py "$RUNNER_TEMP/fresh_install_check.py"
-          # no PYTHONPATH, no ARK_BRIDGE_BIN, no source checkout on the path
+          # test outside the repo, no env overrides
           unset PYTHONPATH ARK_BRIDGE_BIN
           cd "$RUNNER_TEMP"
           "$PY" fresh_install_check.py
@@ -119,7 +118,7 @@ jobs:
           python -c "import hashlib,sys;print('sha256: ',hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$WHEEL"
 
       - name: Upload wheel artifact (NOT a release, NOT PyPI)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.name }}
           path: sdk/python/dist/*.whl

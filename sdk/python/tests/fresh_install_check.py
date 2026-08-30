@@ -1,12 +1,9 @@
-"""Fresh-install acceptance check — run from a venv that has ONLY the installed ark-runtime
-wheel, from a directory OUTSIDE the repo, with no PYTHONPATH and no ARK_BRIDGE_BIN.
+"""Checks a fresh wheel install actually works. Run from a venv that only has ark-runtime
+installed, from a dir outside the repo, with no PYTHONPATH and no ARK_BRIDGE_BIN.
 
-    python tests/fresh_install_check.py     # (path is just where this file happens to live)
+    python fresh_install_check.py
 
-Proves the whole out-of-the-box experience: package imports, bundled bridge auto-discovered
-and started, Go runtime responds, canonical RunResult returns, telemetry + cost reconcile,
-ark.trace works, supervision is OFF by default, and the LangGraph extra behaves. Prints a
-report and exits non-zero on any failure. Never prints secrets.
+Fails (nonzero exit) if anything is off. Doesn't print secrets.
 """
 import math
 import os
@@ -27,7 +24,7 @@ def main():
     check("cwd is outside a source checkout (no ./ark package)",
           not os.path.isdir(os.path.join(os.getcwd(), "ark")))
 
-    # 1. package import (base SDK, no LangGraph)
+    # import the base SDK
     import ark
     from ark import ARK
     from ark.bridge import _bundled_binary, _find_binary
@@ -40,18 +37,18 @@ def main():
     check("_find_binary resolves to the bundled bridge with no override",
           "_bridge" in _find_binary())
 
-    # 2. normal ark.run through the bundled bridge (mock mode — no external credentials)
+    # run a task (mock mode, no api key needed)
     print("\nARK().run (mock):")
     r = ARK().run(task="find the top Python web frameworks on GitHub")
     check("bundled bridge started and returned a RunResult", r is not None)
     check("run succeeded", r.success is True)
     check("decision telemetry present", len(r.decisions) >= 1 and bool(r.decisions[0].model))
     total = sum(d.cost.total_cost for d in r.decisions)
-    check("cost reconciles (Σ decisions == total_cost)", math.isclose(total, r.total_cost, abs_tol=1e-9))
+    check("cost reconciles (sum decisions == total_cost)", math.isclose(total, r.total_cost, abs_tol=1e-9))
     check("cost_by_model reconciles", math.isclose(sum(r.cost_by_model.values()), r.total_cost, abs_tol=1e-9))
     print(f"    run_id={r.run_id} decisions={len(r.decisions)} total_cost={r.total_cost}")
 
-    # 3. external-agent trace API
+    # the trace API
     print("\nark.trace (external-agent API):")
     with ark.trace("test") as run:
         run.record(action="tool_call", model="gpt-4o-mini", tool="search",
@@ -62,7 +59,7 @@ def main():
     check("trace cost reconciles",
           math.isclose(sum(d.cost.total_cost for d in tr.decisions), tr.total_cost, abs_tol=1e-9))
 
-    # 4. supervision OFF by default
+    # supervision should be off by default
     print("\nsupervision default:")
     from ark import ArkSupervisionDisabled
     off = False
@@ -72,7 +69,7 @@ def main():
         off = True
     check("experimental supervision is OFF by default", off)
 
-    # 5. LangGraph optional extra behavior
+    # langgraph extra (optional)
     print("\nLangGraph extra:")
     try:
         import langgraph  # noqa: F401
