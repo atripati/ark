@@ -36,7 +36,7 @@ try:
 except ModuleNotFoundError as e:  # optional dependency — give a clear, actionable message
     raise ImportError(
         "ARK's LangGraph integration requires the optional 'langgraph' extra. "
-        "Install it with:  pip install 'ark-runtime-sdk[langgraph]'  "
+        "Install it with:  pip install 'ark-runtime[langgraph]'  "
         "(or:  pip install langgraph langchain-core ). "
         "The core ARK SDK (import ark) does not need it."
     ) from e
