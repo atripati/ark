@@ -1,6 +1,7 @@
 # Wheels ship only the `ark` package (+ its bundled bridge via package-data). This keeps any
 # source distribution equally clean: no tests, examples, build scripts, or binaries.
 include README.md
+include LICENSE
 prune tests
 prune examples
 exclude build_wheel.sh

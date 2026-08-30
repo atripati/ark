@@ -8,7 +8,8 @@ version = "0.1.0a1"
 description = "ARK Runtime SDK — attach ARK decision telemetry, cost attribution, and (experimental) constrained supervision around your existing agent."
 readme = "README.md"
 requires-python = ">=3.9"
-license = "LicenseRef-Proprietary"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Abhishek Tripathi" }]
 keywords = ["ark", "agent", "llm", "telemetry", "cost", "supervision", "observability", "langgraph"]
 classifiers = [
