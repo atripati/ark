@@ -1,573 +1,210 @@
-# ARK — AI Runtime Kernel
+# ARK
 
-**Cut agent costs by 80–90%. Make every step verifiable. Ship agents that don't hallucinate.**
+Runtime supervision and observability for AI agents.
 
-ARK doesn't let the model control the system. The runtime does.
+Keep your model.
+Keep your agent.
+Keep your tools.
+Add ARK around the runtime.
 
-It decides which tools run, which model handles each step, how much each decision costs, and whether the output is valid — before anything reaches the user. The model's job is reduced to what it's good at: language. Everything else is governed.
+ARK sits around the decisions an agent makes. It records what happened and what it cost. With experimental supervision turned on, it can also check a proposed tool action before that action runs.
 
+```bash
+pip install ark-runtime
 ```
-┌─ ARK Agent: Task "ark-run"
-│  write a function in Go that reads CSV
-│
-├─ Task type: coding
-├─ Context: loaded 2 tools (42 tokens) [strategy: minimal]
-├─ Step 1: ✓ Reasoning verified (confidence: 70%)
-│  🧪 Verification: tested (score: 100%)
-│  ✅ Compiled
-│  ✅ Executed
-│  ✅ Tests passed
-│  ✅ Lint clean
-├─ Step 1: COMPLETE — func readCSV(filePath string) ([][]string, error)
-│
-└─ Done: 1 step, 637 tokens, 5.6s | Cost: $0.002
-
-════════════════════════════════════════════════════════════
-  🧠 ARK Memory — Learning from this execution
-════════════════════════════════════════════════════════════
-
-  📥 Ingested 2 new events
-  📊 Total experience: 20 memories
-  🚀 Context for next run:
-     Tool experience: github_search_repos — 100% success (2 uses)
-     Past: 'find Python frameworks' succeeded in 2 steps, $0.005
-     Past: 'write CSV reader' succeeded in 1 step, $0.002
-```
-
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go)](https://go.dev)
-[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python)](https://python.org)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-210%2B%20passing-brightgreen?style=flat-square)]()
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](CONTRIBUTING.md)
-
----
-
-## Why ARK Exists
-
-Current agent frameworks have a fundamental design flaw: **they let the model make infrastructure decisions.**
-
-The model picks which tools to call. The model decides if the output is good enough. The model controls retry logic. This is like letting a database query decide its own execution plan.
-
-ARK inverts this. The runtime makes every infrastructure decision. The model only does language work.
-
-| What other frameworks do | What ARK does |
-|--------------------------|---------------|
-| Dump all 140 tool schemas into prompt | Load 3 relevant tools per task (99.9% context reduction) |
-| Use one model for every step | Route each step: cheap model for tool calls, strong for reasoning |
-| No cost visibility until the bill | Per-decision cost graph — every step has a dollar amount |
-| Trust model output blindly | Cognitive governor verifies every output with calibrated confidence |
-| Every run starts from zero | Bayesian learning persists across runs — Run 2 is smarter than Run 1 |
-| Forward raw queries to APIs | Query intelligence: noise stripping, language detection, semantic scoring |
-
----
-
-## What Makes ARK Different
-
-### 1. Cognitive Governor
-
-The governor is the core of ARK. It sits between every model call and the user, enforcing trust.
-
-```
-Task → Classify → Predict failure → Select model → Execute → Verify → Learn → Output
-         ↑                                                       │
-         └───────────── Registry feeds back ─────────────────────┘
-```
-
-Every output gets a calibrated confidence score — not a flat number, but a signal computed from model history, tool track record, response quality, and grounding:
-
-```
-├─ Step 1: TOOL_CALL — github_search_repos
-│  ↳ ✓ Verified (confidence: 88%)     ← model proven on this tool
-├─ Step 2: ✓ Reasoning verified (confidence: 87%)  ← grounded in tool data
-```
-
-**Confidence is variable, not decorative:**
-- 85-88% → grounded reasoning with proven model+tool combo
-- 75% → pure reasoning without tool data
-- 50% → ungrounded (model answered without calling tools)
-- Below 60% → forces strong model on next step automatically
-
-The governor also:
-- **Predicts failures** before execution — skips models with bad track records
-- **Injects experience** into prompts ("Previous attempts with this tool had failures. Be more careful.")
-- **Tracks per-task-type performance** — learns that gpt-4o-mini handles retrieval but struggles with ranking
-- **Records task-type observations** — the registry knows performance per domain, not just per model
-
-### 2. Per-Step Model Routing
-
-ARK doesn't use one model for everything. Each step gets the right model:
-
-```
-🧠 Model Routing:
-  Step 1 [tool_call] gpt-4o-mini  (tool calls are simple, using fast model to save cost)
-  Step 2 [complete]  gpt-4o       (final reasoning benefits from strong model)
-
-  Fast model: 1 step | Strong model: 1 step
-```
-
-The router learns from failures. If the fast model fails on a step type, ARK promotes it to the strong model next time. Learning persists across restarts.
-
-### 3. Search Intelligence (7-Phase Pipeline)
-
-Most agent frameworks send the user's raw query to an API and hope for the best. ARK owns the entire retrieval pipeline:
-
-```
-"find the top 5 most popular JavaScript backend frameworks on GitHub"
-
-Phase 1: Query Intelligence
-  → Strip noise: "javascript frameworks"
-  → Detect language: JavaScript
-  → Add ecosystem hint: +nodejs
-  → Skip API language filter for JS (TypeScript repos also needed)
-
-Phase 2: Retrieval
-  → GitHub API: sort=stars, order=desc, per_page=30
-
-Phase 3: Language Filter
-  → Accept: JavaScript + TypeScript (NestJS, Fastify are TS)
-  → Reject: Java, Python, etc.
-
-Phase 4: Junk Filter
-  → Remove: awesome-lists, tutorials, cheatsheets, interview prep
-
-Phase 5: Semantic Scoring (3-tier)
-  → "web framework" in description  → 2.0× boost (Express, Fastify)
-  → No framework signal             → 0.3× penalty (unknown relevance)
-  → Anti-signal (ORM, CSS, testing) → 0.01× buried (Mocha, MUI)
-
-Phase 6: Diversity Guard
-  → Max 2 repos per owner (prevents Django/Django-channels clustering)
-
-Phase 7: Simplify
-  → Essential fields only → LLM explains, never selects
-```
-
-The LLM never decides what's relevant. The runtime ranks. The LLM explains.
-
-### 4. Code Verification Engine
-
-ARK doesn't trust generated code. It compiles, runs, and tests it before delivering.
-
-```
-├─ Step 1: ✓ Reasoning verified (confidence: 70%)
-│  🧪 Verification: tested (score: 100%)
-│  ✅ Compiled         ← go build passed
-│  ✅ Executed          ← go run passed
-│  ✅ Tests passed      ← auto-generated tests passed
-│  ✅ Lint clean        ← go vet passed
-│  ✔ code_extraction (1 code block(s) found)
-│  ✔ structural_lint (0 issues)
-│  ✔ constraints (0 violations)
-│  ✔ compilation (compiled successfully)
-│  ✔ execution (ran without error)
-│  ✔ tests (auto-generated tests passed)
-│  ✔ lint (0 warnings)
-```
-
-The verification pipeline:
-
-| Phase | What it does |
-|-------|-------------|
-| Extract | Pull code blocks, auto-detect language |
-| Auto-Fix | Fix common model errors (orphan braces, missing error handling) |
-| Structural Lint | Check braces, parens, completeness, placeholders |
-| Constraint Check | Over-commenting, filler comments, unused imports |
-| Compile | `go build` / `python -m py_compile` / `node --check` |
-| Execute | Run with 10s timeout |
-| Auto-Test | Generate smoke tests for functions, run `go test` |
-| Lint | `go vet` for static analysis |
-
-If code fails verification, ARK self-corrects: feeds the compiler error back to the model, forces the strong model, and retries. If it still fails after 2 attempts, ARK refuses to deliver broken code.
-
-### 5. ARK Memory — Persistent Agent Experience
-
-Every AI agent has amnesia. ARK Memory fixes it.
 
 ```python
-from ark_memory import Agent, Experience
-
-agent = Agent("my-agent")
-exp = Experience(agent)
-
-# Agent learns from every execution automatically
-exp.tool_succeeded("github_search_repos", "python frameworks", duration_ms=2500)
-exp.tool_failed("web_search", "latest news", error="API key missing")
-exp.strategy_learned("coding", "strip test instructions", improvement="eliminated import conflicts")
-
-# Next run — agent queries its own experience
-best = exp.best_tool_for("search repositories")
-# → github_search_repos: 100% success, avg 2500ms
-
-context = exp.execution_context("coding task")
-# → Learned strategies, tool performance, failures to avoid
+from ark import ARK
 ```
 
-ARK Memory is a separate Python package (`pip install ark-memory`) with:
-- SQLite persistence — survives crashes, zero config
-- Semantic search via cosine similarity on embeddings
-- Time decay with configurable half-life
-- Namespace isolation (per agent, per user, per session)
-- Anti-redundancy deduplication
-- Auto-learning collector that ingests Runtime events
+This is alpha software, version 0.1.0a1.
 
-### 6. Unified Execution — One Command, Both Layers
+## Why ARK
+
+An agent can know a rule and still propose the wrong tool call. Once that call runs, explaining it correctly afterward does not undo the side effect. The booking already happened. The row was already written.
+
+ARK sits at that point, just before the call runs. It gives the runtime a place to look at the proposed action, the rule that applies, and the trusted evidence, and then decide whether the call goes through.
+
+```
+agent proposes an action
+        |
+        v
+     ARK check
+      |     \
+   ALLOW     not ALLOW
+      |          \
+   it runs     feedback goes back, the agent proposes again
+```
+
+## Install
 
 ```bash
-./ark-run.sh "write a function in Go that reads CSV"
+pip install ark-runtime
 ```
 
-Runtime executes the task → emits events → Memory ingests them automatically. Each run makes the next one smarter.
+The wheel ships with the Go runtime bridge for your platform. You do not need Go installed, the source repo, `PYTHONPATH`, or `ARK_BRIDGE_BIN`. The import stays `from ark import ARK`.
 
-```
-════════════════════════════════════════════════════════════
-  🧠 ARK Memory — Learning from this execution
-════════════════════════════════════════════════════════════
+## Two ways to use ARK
 
-  📥 Ingested 2 new events
-  📊 Total experience: 20 memories
-     Tool successes: 7
-     Executions: 10
+### 1. Run a task through ARK
 
-  🚀 Context for next run:
-  Tool experience:
-    - github_search_repos: 100% success (2 uses)
-  Past execution history:
-    - Task 'write CSV reader' succeeded in 1 step, $0.002
-    - Task 'find Python frameworks' succeeded in 2 steps, $0.005
+```python
+from ark import ARK
 
-════════════════════════════════════════════════════════════
-  Every run makes the next one smarter.
-════════════════════════════════════════════════════════════
+ark = ARK()
+result = ark.run("hello from ARK", mode="mock")
+
+print(result.success, result.total_cost)
+for d in result.decisions:
+    print(d.id, d.action, d.model, d.cost.total_cost)
 ```
 
-### 7. Decision-Level Cost Attribution
+Mock mode works with no API key, so you can try it right away. `mode="live"` runs a real provider and needs a configured model, meaning an API key and an `agent.yaml`.
 
-Every step has a price tag. Cost feeds back into ranking.
+### 2. Put ARK around your own agent
 
-```
-💰 Cost Report: ark-run
-  Total Cost: $0.004840
-    Input:  $0.002750 (1100 tokens)
-    Output: $0.002090 (209 tokens)
+You do not replace your agent to use ARK. You keep your framework, your model, and your tools, and you report what the agent did. ARK builds the same result.
 
-  Decision Cost Graph:
-    Step 1 [tool_call: github_search_repos]  $0.000990
-    Step 2 [complete]                        $0.003850
-```
+```python
+from ark import ARK
 
-### 5. Task Classification
+ark = ARK()
+with ark.trace("book the second cheapest flight") as run:
+    # your loop, your model, your tools
+    run.record(action="tool_call", tool="search", model="gpt-4o-mini",
+               input_tokens=449, output_tokens=16, outcome="success")
 
-ARK classifies every task before execution and adapts its behavior:
-
-```
-├─ Task type: ranking          ← detected from "top", "most popular"
+result = run.result
+print(result.total_cost, [d.model for d in result.decisions])
 ```
 
-| Task Type | Behavior |
-|-----------|----------|
-| ranking | Strong model for reasoning, search tool preferred |
-| retrieval | Cheap model sufficient, list tool preferred |
-| coding | Strong model, code-specific verification |
-| multi_step | High effort, full verification pipeline |
-| summarization | Medium effort, grounded check |
+This is the mode that matters if you already have an agent. ARK never runs your model. You do.
 
-### 6. Adaptive Learning
+## Observability
 
-ARK remembers across runs. Tool scores evolve based on real outcomes.
+Every run returns a `RunResult` with a list of decisions. A decision can carry:
 
+- model and provider
+- input and output tokens
+- cost, which ARK works out from the tokens and model when you do not pass a cost yourself
+- the tool or proposed action, and its outcome
+- verification, when your runtime reports it
+- a supervision verdict, when supervision is on
+- a stable id, so a proposed action and the action that actually ran can point to the same decision
+- latency, when it is available
+
+Run totals include total cost, total tokens, and cost grouped by model, by tool, and by action.
+
+Not every provider returns every field. Fields that are missing stay empty. ARK does not fill them in. `run.provenance` tells you, per decision, which facts your runtime reported and which ARK worked out.
+
+## Runtime supervision (experimental)
+
+Supervision is experimental and off by default. Turn it on with `ARK(supervision="experimental")`.
+
+The flow:
+
+1. your agent proposes an action
+2. ARK checks the constraint that applies
+3. ARK checks the trusted evidence you provide
+4. ARK returns a verdict
+5. on a verdict other than ALLOW, the agent gets feedback and decides again
+6. your integration runs the action only after ALLOW
+
+Verdicts are `ALLOW`, `REJECT`, `REQUIRE_EVIDENCE`, and `RECOVERY_EXHAUSTED`.
+
+```python
+from ark import ARK
+
+with ARK(supervision="experimental").trace("book a flight") as run:
+    verdict = run.check(
+        proposed_action={"option": "A"},
+        constraint="rank",
+        evidence={
+            "requested_rank": 2,
+            "evidence_complete": True,
+            "options": [{"id": "A", "price": 163}, {"id": "B", "price": 290}],
+        },
+        tool="book",
+    )
+    if verdict.allowed:
+        ...  # run the tool
+    else:
+        # the agent reads the verdict and the feedback, then proposes the next action itself
+        ...
 ```
-RUN 1: github_list_repos = 0.55   (no history)
-RUN 2: github_list_repos = 0.69   (1 success)
-RUN 3: github_list_repos = 0.95   (2 successes, compounding)
 
-RUN 1: github_search = 0.55       (no history)
-RUN 2: github_search = 0.42       (1 failure, demoted)
-```
+The agent stays the author. ARK returns a verdict and feedback grounded in the evidence. It does not write the next action. The agent reads that feedback and decides what to do next.
 
-Learning is bounded — history can't dominate. Confidence capped at 0.80. New tools get exploration bonuses. Intent-matching boosts the right tool for the right query.
+Supervision is not a correctness guarantee. It does not make an agent safe, and it does not catch every bad action. It gives the runtime one place to check a proposed action against a rule and trusted evidence before the action runs.
 
----
+## LangGraph
 
-## By the Numbers
-
-| Metric | Raw MCP | ARK | Improvement |
-|--------|---------|-----|-------------|
-| Context per task | 60,468 tokens | ~93 tokens | **99.9% reduction** |
-| Cost per task | ~$0.05 | ~$0.005 | **10× cheaper** |
-| Tools loaded | All 140 | 3 relevant | **97% fewer** |
-| Steps to answer | 1 (expensive) | 2 (cheap + strong) | **Right model per step** |
-| Verification | None | Every output | **Variable confidence** |
-| Learning | None | Persistent | **Run 2 > Run 1** |
-
----
-
-## Quick Start
+There is a real integration with LangGraph. You keep your LangGraph agent, your model, and your tools.
 
 ```bash
-git clone https://github.com/atripati/ark.git
-cd ark
-
-# No API keys needed for demos
-go run ./cmd/ark bench        # see context savings (99.9% reduction)
-go run ./cmd/ark demo         # see failure → adapt → recover
-go run ./cmd/ark demo-learn   # see ranking improve across 3 runs
-
-# With OpenAI (~$0.005 per task)
-export OPENAI_API_KEY=sk-...
-export GITHUB_TOKEN=ghp_...
-
-# Run Runtime only
-go run ./cmd/ark run agent.yaml --task "find the top 3 Python web frameworks on GitHub"
-
-# Run Runtime + Memory together (one command)
-chmod +x ark-run.sh
-./ark-run.sh "find the top 3 Python web frameworks on GitHub"
-
-# Install ARK Memory separately
-cd ark-memory
-pip install -e .
-pytest tests/ -v   # 55+ tests
+pip install "ark-runtime[langgraph]"
 ```
 
-## Configuration
-
-```yaml
-name: my-agent
-version: "0.1"
-
-model:
-  provider: openai           # openai | anthropic | ollama
-  name: gpt-4o
-  max_tokens: 4096
-  strategy: cost_optimized   # single | cost_optimized | quality_first
-  fast_model: gpt-4o-mini
-  strong_model: gpt-4o
-
-context:
-  total_tokens: 200000
-  strategy: adaptive
-  tool_budget: 10%
-  memory_budget: 10%
-  conversation_budget: 35%
-  max_steps: 5
-  timeout_seconds: 120
-
-memory:
-  backend: file
-  path: "./ark-memory.json"
+```python
+from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool
 ```
 
-## Connect Any API
+To observe, pass `ArkCallbackHandler(run)` in the callbacks and ARK records the model and tool decisions from LangChain's callback events.
 
-```yaml
-tools:
-  - name: get_weather
-    type: http
-    method: GET
-    uri: "https://api.openweathermap.org/data/2.5/weather?q={city}&appid=${OPENWEATHER_KEY}"
-    description: "get current weather for a city"
-    params:
-      - city
+To supervise, wrap a tool with `ark_supervise_tool(run, tool, constraint=..., evidence=...)`. Before the real tool runs, ARK checks the proposed action. On a verdict other than ALLOW the tool does not run, and ARK returns feedback grounded in the evidence as the tool result. LangGraph feeds that back to the model, and the model decides what to do next.
 
-  - name: slack_post
-    type: http
-    method: POST
-    uri: "https://slack.com/api/chat.postMessage"
-    description: "post a message to a Slack channel"
-    params: [channel, text]
-    headers:
-      Authorization: "Bearer ${SLACK_TOKEN}"
-    write: true   # requires --allow-write
-```
+In a live run with a real OpenAI model:
 
-ARK handles domain allowlisting, parameter validation, cost tracking, and learning for custom tools automatically.
+- the model proposed action A
+- ARK rejected A before its side effect
+- the feedback went back to LangGraph
+- the model proposed action B
+- ARK allowed B
+- only B ran
 
-## Built-in Tools
+ARK did not write action B. The model did. This shows the mechanism can supervise a real external agent framework while the agent keeps authorship. It does not show that ARK improves every LangGraph agent.
 
-| Category | Tools | Auth |
-|----------|-------|------|
-| GitHub | list_repos, get_repo, list_issues, create_issue, list_pulls, get_user, **search_repos** | GITHUB_TOKEN (optional) |
-| Web Search | web_search, web_search_news | BRAVE_API_KEY |
-| File System | file_read, file_write, file_list | None |
-| Custom HTTP | Any REST API via agent.yaml | Defined in config |
+## Evidence
 
-**12 tools** across 4 categories. All ranked, learned, and cost-tracked automatically.
+Two separate results.
 
-## Safety
+**A scoped benchmark.** In a paired K=16 tau bench airline evaluation, on one constrained recovery failure class, ARK raised task success from 6.25% to 81.25%, which is 1 of 16 up to 13 of 16.
 
-Safe by default. Dangerous operations require explicit opt-in.
+| supervision | tasks passed |
+|-------------|--------------|
+| OFF         | 1 of 16      |
+| ON          | 13 of 16     |
 
-```bash
-ark run agent.yaml --task "list repos"          # ✅ reads work
-ark run agent.yaml --task "create issue"        # ❌ blocked
-ark run agent.yaml --task "create issue" --allow-write  # ✅ opt-in
-ark run agent.yaml --task "create issue" --dry-run      # ✅ simulate
-```
+This is one constrained recovery failure class in the tau bench airline research environment. tau bench airline is a research benchmark, not an airline. It is not a general reliability result. It does not mean ARK improves all agents, and it does not solve hallucinations. In the same evaluation there were nine directly attributable recoveries and zero observed regressions, rank was satisfied on all 16 of 16 trials, and there were zero false rejects and zero evidence leakage.
 
-## Architecture
+**A real external agent.** The LangGraph live run above shows the same mechanism working around a real agent framework while the model keeps authorship.
 
-```
-ark/
-├── cmd/ark/                    CLI entry point
-│   └── main.go                 Config, agent setup, event emitter init
-├── ark-memory/                 Persistent agent memory (Python)
-│   ├── ark_memory/
-│   │   ├── agent.py            Agent class (remember/recall/context/forget)
-│   │   ├── store.py            SQLite persistence, vector search, multi-signal ranking
-│   │   ├── embeddings.py       Local hash-based + optional OpenAI embeddings
-│   │   ├── experience.py       Experience engine (tool tracking, strategy learning)
-│   │   ├── collector.py        Auto-learning collector (ingests Runtime events)
-│   │   └── types.py            Memory, RecallResult, MemoryConfig
-│   └── tests/                  55+ tests
-├── ark-run.sh                  Unified run script (Runtime + Memory)
-├── pkg/
-│   ├── config/                 YAML config + validation
-│   ├── context/                Context engine (99.9% reduction)
-│   │   ├── engine.go           Tool ranking (6 signals, Bayesian confidence)
-│   │   └── manager.go          Context window management
-│   ├── governor/               Cognitive supervisor
-│   │   ├── registry.go         Model capability registry (Bayesian learning)
-│   │   ├── verifier.go         Output verification (variable confidence)
-│   │   ├── intelligence.go     Task classification, failure prediction
-│   │   └── adapter.go          Runtime bridge
-│   ├── models/                 LLM providers (Anthropic, OpenAI, Ollama)
-│   ├── router/                 Per-step model routing (persistent learning)
-│   ├── runtime/                Agent execution loop
-│   │   ├── agent.go            Execution loop, governor integration
-│   │   ├── verify.go           Code verification (compile, test, lint)
-│   │   ├── quality.go          Quality layer (auto-fix, prompt optimization)
-│   │   └── events.go           Event emitter (JSONL bridge to Memory)
-│   ├── cost/                   Decision-level cost attribution
-│   ├── store/                  Persistent learning (JSON, decay, snapshots)
-│   └── tools/                  Tool implementations
-│       ├── github.go           7 GitHub tools + search intelligence pipeline
-│       ├── websearch.go        Brave Search (web + news)
-│       ├── filesystem.go       File system (read/write/list)
-│       └── custom.go           Custom HTTP tool engine
+One result proves a mechanism on a scoped benchmark failure class. The other proves the mechanism can supervise a real external framework. They are different claims.
 
-Go Runtime:  35 files | 156+ tests | Race detector clean | 12 tools
-Python Memory: 9 files | 55+ tests | Zero config | 4,800 events/sec
-Total: 44 files | 210+ tests | One command runs both layers
-```
+## Supported platforms
 
-## How the Scoring Works
+CI builds a wheel for each of these and fresh installs it in a clean environment outside the repo:
 
-Every tool gets a composite score from weighted signals:
+- macOS Apple Silicon (arm64)
+- macOS Intel (x86_64)
+- Linux x86_64
+- Linux arm64
+- Windows x86_64
 
-| Signal | Weight | What it measures |
-|--------|--------|-----------------|
-| Relevance | 50% | Keyword match + intent boost |
-| Success rate | 20% | Historical success/failure ratio |
-| Confidence | 5% | Data volume (capped at 0.80 to prevent bias) |
-| Cost | -10% | Real dollar cost per call |
-| Latency | -5% | Penalty for slow tools |
-| Memory bonus | up to 10% | Similar query succeeded before |
+Each wheel carries the Go bridge for its platform.
 
-New tools get an exploration bonus (+0.15) so they can compete with established tools. Intent keywords ("top", "popular", "best") boost search tools by +0.40.
+## Also in ARK
 
-## Production Guarantees
+When ARK runs the workload itself with `ark.run`, it also routes each step to a model and can run structural checks on code output, such as compile and lint. Those show up in the same telemetry. They are secondary to the observability and supervision story above.
 
-| Guarantee | How |
-|-----------|-----|
-| No hallucination when tools available | Governor blocks ungrounded responses |
-| Code is verified before delivery | Compile → execute → test → lint pipeline |
-| Never delivers broken code as success | Hard fail enforcement after max retries |
-| Auto-fixes common model errors | Orphan braces, missing error handling, indentation |
-| Variable confidence | 88% grounded, 75% pure reasoning, 50% ungrounded |
-| No invalid tool calls | RequiredParams validated before execution |
-| No runaway loops | MaxSteps=5, TotalTimeout=120s, per-tool retry budget, max 2 self-corrections |
-| Cost-aware | Per-decision cost graph, budget enforcement |
-| Self-improving | Bayesian learning + experience memory, persistent across restarts |
-| Failure prediction | Governor predicts failures before execution |
-| Task-aware routing | Ranking tasks force strong model, tool calls use cheap model |
-| Diversity enforcement | Max 2 repos per owner, junk filtering |
-| Semantic scoring | 3-tier relevance (boost / penalize / bury) |
-| Experience accumulation | Every run feeds into the next via ARK Memory |
+## Alpha
 
-## Stress Tested
-
-```
-Sequential (20 runs):  20/20 completed, 0 crashes, 0 hallucinated data
-Parallel (10 runs):    10/10 completed, 0 crashes, 0 state corruption
-
-Failures handled correctly:
-  401 (no auth)     → LLM retried with user param → succeeded
-  Tool hallucinated → rejected, valid tools listed → LLM self-corrected
-  Timeout           → clean termination with structured error
-```
-
-## Roadmap
-
-### v1.0 — Cognitive Governor ✅
-- [x] Cognitive governor (verifier + registry + intelligence layer)
-- [x] Task classification (ranking, retrieval, coding, multi_step, reasoning)
-- [x] Variable confidence (model history + tool track record + response quality)
-- [x] Failure prediction (predict → avoid before execution)
-- [x] Experience-aware prompting (inject failure history into prompts)
-- [x] Confidence-driven routing (low confidence → force strong model)
-- [x] Search intelligence (noise stripping, language detection, semantic scoring)
-- [x] Diversity enforcement (max 2 per owner, junk filtering)
-- [x] Context-aware learning (per-task-type performance tracking)
-- [x] Intent-aware tool selection (search vs list based on query signals)
-- [x] Scoring rebalance (relevance dominates, history capped)
-- [x] Tool output trimming (50-70% token reduction)
-- [x] 156 tests, race detector clean, 12 tools
-
-### v1.1 — Code Verification + ARK Memory ✅ (current)
-- [x] Code verification engine (compile, execute, test, lint)
-- [x] Auto-fix: orphan braces, missing error handling, space/tab indentation
-- [x] Task decomposition: strip test instructions from coding tasks
-- [x] Self-correction: 2 retries with strong model, history reset
-- [x] Hard fail enforcement: never deliver broken code as success
-- [x] Quality layer: prompt optimization, response cleaning
-- [x] ARK Memory: persistent semantic memory (Python, SQLite, zero config)
-- [x] Experience engine: tool tracking, strategy learning, model performance
-- [x] Auto-learning collector: ingests Runtime events automatically
-- [x] Event bridge: Go Runtime emits JSONL → Python Memory ingests
-- [x] Unified execution: `ark-run.sh` runs both layers with one command
-- [x] 55+ Python tests, stress tested at 4,800 events/sec
-- [x] 210+ total tests across Runtime + Memory
-
-### v1.2 — Adaptive Execution (next)
-- [ ] Multi-step adaptive chains (fail → recall experience → adapt → succeed)
-- [ ] Experience-aware routing (Memory informs Runtime decisions)
-- [ ] MCP server connector (stdio/SSE)
-- [ ] Auto-discover tools from MCP servers
-
-### v1.3 — Production Runtime
-- [ ] Streaming output
-- [ ] Hot-reload agent configs
-- [ ] Plugin system
-- [ ] OpenTelemetry export
-- [ ] `go get github.com/atripati/ark` library mode
-- [ ] DSL prototype: 10 lines replaces 1000 lines of Python+SQL+VectorDB
-
-## Contributing
-
-ARK is designed to be the foundational runtime for AI agents.
-
-**Good first issues:**
-- Add tiktoken-based token counting
-- Write MCP server connector
-- Add Slack tool set
-- SQLite store backend
-- Add more language detection (Rust, Swift, Kotlin)
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions.
-
-## Why "ARK"
-
-**A**I **R**untime **K**ernel.
-
-Not a framework — frameworks give you scaffolding and hope you fill it in.
-Not a wrapper — wrappers add a layer and call it abstraction.
-
-A kernel. The lowest layer that governs how intelligence is allocated, how decisions are verified, and how money is spent. Every tool call, every model selection, every output flows through ARK before it reaches the user.
-
-The model is the CPU. ARK is the operating system.
+Version 0.1.0a1. The API can still change. Supervision is experimental and off by default.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+The `ark-runtime` package, meaning the Python SDK and the bundled Go bridge, is licensed Apache-2.0. The license ships inside the wheel.
 
-Copyright 2026 Abhishek Tripathi and ARK Contributors.
+## Feedback
+
+Issues and ideas: https://github.com/atripati/ark/issues
