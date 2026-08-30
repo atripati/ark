@@ -68,5 +68,5 @@ calls `langchain.agents.create_agent` when available, else `langgraph.prebuilt.c
 
 Sync graphs (`.invoke(...)`); async/parallel tool fan-out is out of scope. The core SDK has
 no dependency on LangGraph — the integration is imported lazily (a clear install message if
-the extra is missing) and installed via `pip install 'ark-runtime[langgraph]'`. No
+the extra is missing) and installed via `pip install 'ark-agent-runtime[langgraph]'`. No
 CrewAI / OpenAI-Agents adapter, no `wrap()`.

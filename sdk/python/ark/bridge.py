@@ -52,7 +52,7 @@ def _find_binary() -> str:
         if os.path.exists(guess):
             return guess
     raise ArkBridgeError(
-        "ark-bridge binary not found. An installed `ark-runtime` wheel bundles it "
+        "ark-bridge binary not found. An installed `ark-agent-runtime` wheel bundles it "
         "automatically; if you are running from a source checkout, build it with "
         "`go build -o ark-bridge-bin ./cmd/ark-bridge` and set ARK_BRIDGE_BIN."
     )

@@ -10,7 +10,7 @@ Add ARK around the runtime.
 ARK sits around the decisions an agent makes. It records what happened and what it cost. With experimental supervision turned on, it can also check a proposed tool action before that action runs.
 
 ```bash
-pip install ark-runtime
+pip install ark-agent-runtime
 ```
 
 ```python
@@ -39,7 +39,7 @@ agent proposes an action
 ## Install
 
 ```bash
-pip install ark-runtime
+pip install ark-agent-runtime
 ```
 
 The wheel ships with the Go runtime bridge for your platform. You do not need Go installed, the source repo, `PYTHONPATH`, or `ARK_BRIDGE_BIN`. The import stays `from ark import ARK`.
@@ -142,7 +142,7 @@ Supervision is not a correctness guarantee. It does not make an agent safe, and 
 There is a real integration with LangGraph. You keep your LangGraph agent, your model, and your tools.
 
 ```bash
-pip install "ark-runtime[langgraph]"
+pip install "ark-agent-runtime[langgraph]"
 ```
 
 ```python
@@ -203,7 +203,7 @@ Version 0.1.0a1. The API can still change. Supervision is experimental and off b
 
 ## License
 
-The `ark-runtime` package, meaning the Python SDK and the bundled Go bridge, is licensed Apache-2.0. The license ships inside the wheel.
+The `ark-agent-runtime` package, meaning the Python SDK and the bundled Go bridge, is licensed Apache-2.0. The license ships inside the wheel.
 
 ## Feedback
 

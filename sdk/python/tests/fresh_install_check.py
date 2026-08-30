@@ -1,4 +1,4 @@
-"""Checks a fresh wheel install actually works. Run from a venv that only has ark-runtime
+"""Checks a fresh wheel install actually works. Run from a venv that only has ark-agent-runtime
 installed, from a dir outside the repo, with no PYTHONPATH and no ARK_BRIDGE_BIN.
 
     python fresh_install_check.py

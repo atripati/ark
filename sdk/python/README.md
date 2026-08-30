@@ -1,10 +1,10 @@
-# ARK Runtime SDK (`ark-runtime`)
+# ARK Runtime SDK (`ark-agent-runtime`)
 
 Attach ARK's decision telemetry, cost attribution, and (experimental) constrained supervision
 around your existing agent — you keep your model, your tools, and your runtime.
 
 ```bash
-pip install ark-runtime
+pip install ark-agent-runtime
 ```
 
 ```python
@@ -39,7 +39,7 @@ ark.ARK(supervision="experimental")
 ## LangGraph integration (optional)
 
 ```bash
-pip install "ark-runtime[langgraph]"
+pip install "ark-agent-runtime[langgraph]"
 ```
 
 ```python

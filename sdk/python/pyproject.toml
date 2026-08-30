@@ -3,7 +3,7 @@ requires = ["setuptools>=70", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ark-runtime"
+name = "ark-agent-runtime"
 version = "0.1.0a1"
 description = "ARK Runtime SDK — attach ARK decision telemetry, cost attribution, and (experimental) constrained supervision around your existing agent."
 readme = "README.md"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build one platform-specific ark-runtime wheel: compile the Go bridge, drop it into the
+# Build one platform-specific ark-agent-runtime wheel: compile the Go bridge, drop it into the
 # package as data, then build the wheel. Run from a CLEAN checkout of committed source.
 #
 # Usage:
