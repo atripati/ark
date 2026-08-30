@@ -23,8 +23,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos-arm64,    runner: macos-14,         goos: darwin,  goarch: arm64, langgraph: true  }
-          - { name: macos-x86_64,   runner: macos-15-intel,   goos: darwin,  goarch: amd64, langgraph: false }  # intel; plain macos-15 is arm64
+          - { name: macos-arm64,    runner: macos-14,         goos: darwin,  goarch: arm64, plat: macosx_12_0_arm64,  langgraph: true  }
+          - { name: macos-x86_64,   runner: macos-15-intel,   goos: darwin,  goarch: amd64, plat: macosx_12_0_x86_64, langgraph: false }  # intel; plain macos-15 is arm64
           - { name: linux-x86_64,   runner: ubuntu-latest,    goos: linux,   goarch: amd64, plat: manylinux2014_x86_64,  langgraph: true }
           - { name: linux-arm64,    runner: ubuntu-24.04-arm, goos: linux,   goarch: arm64, plat: manylinux2014_aarch64, langgraph: false }
           - { name: windows-x86_64, runner: windows-latest,   goos: windows, goarch: amd64, langgraph: true  }
