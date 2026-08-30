@@ -1,0 +1,126 @@
+name: build-wheels
+
+# Builds and TESTS the five platform wheels from clean committed source, then uploads them
+# only as downloadable CI artifacts. This workflow deliberately does NOT publish anywhere:
+# no TestPyPI, no PyPI, no GitHub Release, no credentials. Publishing is done manually later.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64,    runner: macos-14,         goos: darwin,  goarch: arm64, langgraph: true  }
+          - { name: macos-x86_64,   runner: macos-13,         goos: darwin,  goarch: amd64, langgraph: false }
+          - { name: linux-x86_64,   runner: ubuntu-latest,    goos: linux,   goarch: amd64, plat: manylinux2014_x86_64,  langgraph: true }
+          - { name: linux-arm64,    runner: ubuntu-24.04-arm, goos: linux,   goarch: arm64, plat: manylinux2014_aarch64, langgraph: false }
+          - { name: windows-x86_64, runner: windows-latest,   goos: windows, goarch: amd64, langgraph: true  }
+    steps:
+      - uses: actions/checkout@v4          # clean committed source only
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build tooling
+        run: python -m pip install --quiet build setuptools wheel
+
+      - name: Compile the ark-bridge for this platform
+        run: |
+          set -euo pipefail
+          BIN="sdk/python/ark/_bridge/ark-bridge"
+          [ "${{ matrix.goos }}" = "windows" ] && BIN="${BIN}.exe"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="-s -w" -o "$BIN" ./cmd/ark-bridge
+          echo "BRIDGE_BIN=$BIN" >> "$GITHUB_ENV"
+          ls -la "$BIN"
+
+      - name: Verify macOS floor (minos must equal the advertised 12.0)
+        if: matrix.goos == 'darwin'
+        run: |
+          set -euo pipefail
+          MINOS=$(otool -l "$BRIDGE_BIN" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+          echo "minos=$MINOS"
+          [ "$MINOS" = "12.0" ] || { echo "::error::binary minos $MINOS != advertised 12.0 (Go floor changed)"; exit 1; }
+
+      - name: Verify Linux binary is fully static (no libc dependency)
+        if: matrix.goos == 'linux'
+        run: |
+          set -euo pipefail
+          file "$BRIDGE_BIN"
+          file "$BRIDGE_BIN" | grep -q "statically linked" \
+            || { echo "::error::linux bridge is not static; manylinux tag would be dishonest"; exit 1; }
+
+      - name: Build the wheel
+        working-directory: sdk/python
+        env:
+          ARK_WHEEL_PLAT: ${{ matrix.plat }}   # empty on macOS/Windows (defaults are correct)
+        run: |
+          set -euo pipefail
+          rm -rf build dist
+          python -m build --wheel --no-isolation
+          ls -la dist/
+
+      - name: Audit wheel contents + secrets
+        working-directory: sdk/python
+        run: python tests/audit_wheel.py "$(ls dist/*.whl)"
+
+      - name: Fresh-install test in a clean env OUTSIDE the repo
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls sdk/python/dist/*.whl)"
+          python -m venv "$RUNNER_TEMP/fresh"
+          if [ "$RUNNER_OS" = "Windows" ]; then PY="$RUNNER_TEMP/fresh/Scripts/python"; else PY="$RUNNER_TEMP/fresh/bin/python"; fi
+          "$PY" -m pip install --quiet "$WHEEL"
+          cp sdk/python/tests/fresh_install_check.py "$RUNNER_TEMP/fresh_install_check.py"
+          # no PYTHONPATH, no ARK_BRIDGE_BIN, no source checkout on the path
+          unset PYTHONPATH ARK_BRIDGE_BIN
+          cd "$RUNNER_TEMP"
+          "$PY" fresh_install_check.py
+
+      - name: LangGraph optional-extra install + import
+        if: matrix.langgraph
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls sdk/python/dist/*.whl)"
+          if [ "$RUNNER_OS" = "Windows" ]; then PY="$RUNNER_TEMP/fresh/Scripts/python"; else PY="$RUNNER_TEMP/fresh/bin/python"; fi
+          "$PY" -m pip install --quiet "${WHEEL}[langgraph]"
+          "$PY" - <<'PY'
+          from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool, build_agent
+          print("LangGraph adapter imports with the extra installed")
+          PY
+
+      - name: Report artifact facts (filename, tag, size, sha256)
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls sdk/python/dist/*.whl)"
+          echo "wheel:   $(basename "$WHEEL")"
+          echo "goos/goarch: ${{ matrix.goos }}/${{ matrix.goarch }}"
+          echo "size:    $(wc -c < "$WHEEL") bytes"
+          python -c "import hashlib,sys;print('sha256: ',hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$WHEEL"
+
+      - name: Upload wheel artifact (NOT a release, NOT PyPI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: sdk/python/dist/*.whl
+          if-no-files-found: error

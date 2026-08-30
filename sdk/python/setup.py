@@ -28,8 +28,15 @@ class bdist_wheel(_bdist_wheel):
 
     def get_tag(self):
         _python, _abi, plat = super().get_tag()
-        # Pin the macOS version component to the bundled binary's real floor (must be <= the
-        # binary's minos, verified at build time). Default 12.0 = the Go 1.26 arm64 floor.
+        # Explicit override for platforms where the building Python's tag is wrong for a
+        # bundled standalone binary. Linux uses this: a CGO_ENABLED=0 bridge is fully static
+        # (no libc), so it is honestly manylinux2014-compatible even though the build host
+        # reports a bare `linux_x86_64`. CI sets ARK_WHEEL_PLAT=manylinux2014_{x86_64,aarch64}.
+        forced = os.environ.get("ARK_WHEEL_PLAT")
+        if forced:
+            return "py3", "none", forced
+        # macOS: pin the version component to the bundled binary's real floor (must be <= the
+        # binary's minos, verified at build time). Default 12.0 = the Go 1.26 macOS floor.
         target = os.environ.get("ARK_MACOS_MIN", "12.0")
         if plat.startswith("macosx_"):
             arch = plat.rsplit("_", 1)[-1]
