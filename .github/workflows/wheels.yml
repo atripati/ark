@@ -123,3 +123,64 @@ jobs:
           name: wheel-${{ matrix.name }}
           path: sdk/python/dist/*.whl
           if-no-files-found: error
+
+  # Python-version compatibility (separate from the 5-platform wheel matrix above; does not
+  # touch it). Verifies committed source imports, builds, and passes the core test suite on
+  # every supported Python, and tests the LangGraph integration only where its 1.x stack is
+  # actually installable (Python 3.10+). Build/test only — no publish.
+  python-compat:
+    name: py-compat ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7          # committed source only
+
+      - uses: actions/setup-go@v7          # the session tests build the bridge (conftest)
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "${{ matrix.python }}"
+
+      - name: Tooling
+        run: python -m pip install --quiet pytest build
+
+      - name: Import + build the core package (zero runtime deps) on this Python
+        working-directory: sdk/python
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -c "import ark, sys; print('import ark', ark.__version__, 'on', sys.version.split()[0])"
+          python -m build --sdist --outdir "$RUNNER_TEMP/sdist"   # packaging metadata builds here
+
+      - name: Core test suite (LangGraph tests self-skip while the extra is absent)
+        working-directory: sdk/python
+        run: PYTHONPATH=. python -m pytest tests -q
+
+      - name: LangGraph integration (Python 3.10+, where LangChain/LangGraph 1.x is supported)
+        if: matrix.python != '3.9'
+        working-directory: sdk/python
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet langgraph langchain-core
+          PYTHONPATH=. python -m pytest tests/test_langgraph.py tests/test_langgraph_authorship.py tests/test_error_propagation.py -q
+
+      - name: Confirm [langgraph] is honestly unavailable on 3.9 (not silently broken)
+        if: matrix.python == '3.9'
+        working-directory: sdk/python
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python - <<'PY'
+          import ark  # core must import on 3.9
+          try:
+              import ark.integrations.langgraph  # noqa: F401
+          except ImportError as e:
+              assert "langgraph" in str(e).lower(), e
+              print("py3.9: core ARK imports; [langgraph] unavailable as expected:", str(e)[:110])
+          else:
+              raise SystemExit("unexpected: LangGraph integration importable on Python 3.9")
+          PY

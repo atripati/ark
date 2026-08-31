@@ -44,7 +44,9 @@ except ModuleNotFoundError as e:  # optional dependency — give a clear, action
         "ARK's LangGraph integration requires the optional 'langgraph' extra. "
         "Install it with:  pip install 'ark-agent-runtime[langgraph]'  "
         "(or:  pip install langgraph langchain-core ). "
-        "The core ARK SDK (import ark) does not need it."
+        "The core ARK SDK (import ark) does not need it. "
+        "Note: the extra needs Python >=3.10 because LangChain/LangGraph 1.x dropped 3.9, "
+        "so on Python 3.9 the extra installs nothing and this integration is unavailable."
     ) from e
 
 from ..session import RunSession, Verdict

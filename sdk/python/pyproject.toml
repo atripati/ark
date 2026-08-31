@@ -21,10 +21,18 @@ classifiers = [
 ]
 dependencies = []
 
-# The core SDK has no runtime deps. Framework integrations are opt-in extras and are imported
-# lazily, so `import ark` never requires them.
+# The core SDK has no runtime deps and supports Python >=3.9. Framework integrations are opt-in
+# extras, imported lazily, so `import ark` never requires them.
+#
+# The langgraph extra needs Python >=3.10: LangChain/LangGraph 1.x (langgraph, langchain-core)
+# declare requires-python >=3.10, so 3.9 is not honestly supportable for the integration. The
+# python_version marker excludes the extra on 3.9 (installs nothing there) rather than letting
+# pip pull an ancient, untested 0.x langgraph; core ARK on 3.9 is unaffected.
 [project.optional-dependencies]
-langgraph = ["langgraph>=0.2", "langchain-core>=0.3"]
+langgraph = [
+    "langgraph>=0.2; python_version >= '3.10'",
+    "langchain-core>=0.3; python_version >= '3.10'",
+]
 
 [project.urls]
 Homepage = "https://github.com/atripati/ark"

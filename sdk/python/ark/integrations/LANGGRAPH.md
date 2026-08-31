@@ -93,3 +93,9 @@ Sync graphs (`.invoke(...)`); async graphs are out of scope. The core SDK has no
 LangGraph — the integration is imported lazily (a clear install message if the extra is
 missing) and installed via `pip install "ark-agent-runtime[langgraph]"`. No CrewAI /
 OpenAI-Agents adapter, no `wrap()`.
+
+**Python version:** core ARK supports Python >=3.9, but the `[langgraph]` extra needs
+**Python >=3.10** — LangChain/LangGraph 1.x (`langgraph`, `langchain-core`) declare
+`requires-python >=3.10`. The extra's dependency markers exclude 3.9, so on 3.9 the extra
+installs nothing and importing this integration raises the clear install message above; core
+ARK on 3.9 is unaffected.
