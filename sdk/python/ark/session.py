@@ -15,6 +15,7 @@ latency, verification, routing) are reported by the developer and are marked as 
 from __future__ import annotations
 
 import json
+import queue
 import subprocess
 import sys
 import threading
@@ -59,35 +60,64 @@ class _SessionProc:
         self._bin = binary or _find_binary()
         self._timeout = timeout
         self._p: Optional[subprocess.Popen] = None
-        # one line-protocol pipe, so the whole write/flush/readline transaction must be
-        # atomic. LangGraph runs tools (and thus check/record) from a thread pool; without
-        # this lock concurrent callers splice each other's bytes and corrupt the JSON.
+        # one line-protocol pipe, so the whole write/read transaction must be atomic. LangGraph
+        # runs tools (and thus check/record) from a thread pool; without this lock concurrent
+        # callers splice each other's bytes and corrupt the JSON.
         self._io_lock = threading.Lock()
+        # A background reader turns the blocking readline() into a queue we can wait on WITH a
+        # timeout, cross-platform (no select, which does not work on Windows pipes). Responses
+        # arrive in request order because sends are serialized by _io_lock.
+        self._responses: "queue.Queue[bytes]" = queue.Queue()
+        self._reader: Optional[threading.Thread] = None
+        self._dead = False  # set once the session is unusable (timeout / EOF / write error)
 
     def start(self) -> None:
         self._p = subprocess.Popen(
             [self._bin, "--session"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
         )
+        self._dead = False
+        self._responses = queue.Queue()
+        self._reader = threading.Thread(target=self._read_loop, args=(self._p,), daemon=True)
+        self._reader.start()
+
+    def _read_loop(self, proc: subprocess.Popen) -> None:
+        try:
+            for line in iter(proc.stdout.readline, b""):
+                self._responses.put(line)
+        except Exception:
+            pass
+        finally:
+            self._responses.put(b"")  # EOF sentinel: the reader has stopped
 
     def send(self, cmd: dict) -> dict:
         payload = (json.dumps(cmd) + "\n").encode()
-        # Serialize the ENTIRE request/response, not just the write: one request goes out and
-        # exactly one response line is read back before any other thread may touch the pipe.
-        # This only guarantees protocol integrity for concurrent callers; it does not add
-        # parallel-action semantics. Go stays authoritative for verdicts/retry/decision ids.
+        # Serialize the ENTIRE request/response: one request goes out and exactly one response
+        # line is taken before any other thread may proceed. This guarantees protocol integrity
+        # for concurrent callers; it adds no parallel-action semantics. Go stays authoritative.
         with self._io_lock:
-            if self._p is None or self._p.poll() is not None:
+            if self._p is None or self._dead or self._p.poll() is not None:
                 raise ArkBridgeError("session process is not running")
             try:
                 self._p.stdin.write(payload)
                 self._p.stdin.flush()
-                out = self._p.stdout.readline()
             except (OSError, BrokenPipeError) as e:
+                self._dead = True
                 raise ArkBridgeError(f"session transport failed: {e}") from e
-            if not out:
-                err = (self._p.stderr.read() or b"")[:300].decode(errors="replace")
-                raise ArkBridgeError(f"session ended without a response: {err}")
+            try:
+                out = self._responses.get(timeout=self._timeout)
+            except queue.Empty:
+                # the bridge did not answer in time. Kill it and mark the session unusable, so a
+                # late/stale response can never be read as the answer to a later command.
+                self._dead = True
+                self._kill()
+                raise ArkBridgeError(
+                    f"session timed out after {self._timeout}s waiting for a response; the "
+                    f"bridge was terminated and this session is now unusable")
+            if not out:  # EOF sentinel — the bridge exited / closed stdout
+                self._dead = True
+                err = self._drain_stderr()
+                raise ArkBridgeError("session ended without a response" + (f": {err}" if err else ""))
         try:
             data = json.loads(out.decode())
         except json.JSONDecodeError as e:
@@ -96,24 +126,42 @@ class _SessionProc:
             raise ArkBridgeError(data["error"])
         return data
 
+    def _kill(self) -> None:
+        try:
+            if self._p is not None:
+                self._p.kill()
+        except Exception:
+            pass
+
+    def _drain_stderr(self) -> str:
+        # only called on the EOF path, where the process has exited, so read() will not block.
+        try:
+            return (self._p.stderr.read() or b"")[:300].decode(errors="replace") if self._p else ""
+        except Exception:
+            return ""
+
     def close(self) -> None:
-        # take the same lock so we never close stdin while a send() is mid-transaction. This
-        # does not nest inside send() (finish() sends, then __exit__ calls close()), so it
-        # cannot deadlock; a concurrent in-flight send simply completes first.
+        # take the same lock so we never close stdin mid-transaction. It does not nest inside
+        # send() (finish() sends, then __exit__ calls close()), so it cannot deadlock; a
+        # concurrent in-flight send completes (or times out) first. Safe after a timeout too:
+        # _p may already be killed, in which case the teardown below is a no-op that still
+        # clears state and joins the reader.
         with self._io_lock:
-            if self._p is None:
-                return
-            try:
-                if self._p.stdin and not self._p.stdin.closed:
-                    self._p.stdin.close()
-                self._p.wait(timeout=5)
-            except Exception:
+            p, self._p = self._p, None
+            reader, self._reader = self._reader, None
+            self._dead = True
+            if p is not None:
                 try:
-                    self._p.kill()
+                    if p.stdin and not p.stdin.closed:
+                        p.stdin.close()
+                    p.wait(timeout=5)
                 except Exception:
-                    pass
-            finally:
-                self._p = None
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+        if reader is not None:
+            reader.join(timeout=2)  # unblocks on EOF once the process exits
 
 
 class RunSession:

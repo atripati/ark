@@ -5,13 +5,15 @@ proposal -> supervision -> retry -> execution -> outcome -> cost chain.
 import io
 import json as _json
 import math
+import queue
+import subprocess
 import threading
 import time
 
 import pytest
 
 import ark
-from ark import ARK, ArkSupervisionDisabled, RunResult
+from ark import ARK, ArkBridgeError, ArkSupervisionDisabled, RunResult
 from ark.session import Verdict, _SessionProc
 
 
@@ -181,64 +183,18 @@ def test_providers_report_status_not_secrets():
 
 # ---- transport concurrency (regression for the LangGraph ToolNode thread-pool corruption) --
 
-class _FakeProc:
-    """A stand-in bridge with ONE shared response slot. If send() were not fully serialized, a
-    second thread would overwrite the slot between the first thread's write and its readline,
-    so the first thread would read the wrong response. A sleep widens that window. Also tracks
-    the peak number of threads inside a transaction, which must be 1 once the lock is in place.
-    """
-
-    def __init__(self):
-        self._pending = None
-        self.inside = 0
-        self.max_inside = 0
-        self.stdin = _FakeProc._In(self)
-        self.stdout = _FakeProc._Out(self)
-        self.stderr = io.BytesIO(b"")
-
-    def poll(self):
-        return None
-
-    class _In:
-        def __init__(self, p):
-            self.p = p
-            self.closed = False
-
-        def write(self, payload):
-            cmd = _json.loads(payload.decode())
-            self.p.inside += 1
-            self.p.max_inside = max(self.p.max_inside, self.p.inside)
-            time.sleep(0.002)
-            self.p._pending = (_json.dumps({"ok": True, "decision_id": cmd["id"]}) + "\n").encode()
-
-        def flush(self):
-            pass
-
-        def close(self):
-            self.closed = True
-
-    class _Out:
-        def __init__(self, p):
-            self.p = p
-
-        def readline(self):
-            time.sleep(0.002)
-            out = self.p._pending
-            self.p.inside -= 1
-            return out
-
-
-def test_sessionproc_send_is_thread_safe_unit():
-    # deterministic, no bridge: proves the lock serializes the whole write+read transaction.
-    proc = _SessionProc(binary="unused")
-    proc._p = _FakeProc()
+def test_sessionproc_serializes_concurrent_sends_unit():
+    # deterministic, no real bridge (uses _FakeBridge/_attach defined below): many threads hit
+    # one _SessionProc at once. The reader feeds a FIFO queue and the lock makes each send take
+    # exactly its own response, so every request gets ITS OWN id back — a crossed response would
+    # mean the serialization broke.
+    proc = _attach(_FakeBridge(hang=False), timeout=5)
     results, errors = {}, []
 
     def worker(i):
         try:
-            r = proc.send({"cmd": "record", "id": f"req-{i}"})
-            results[i] = r["decision_id"]
-        except Exception as e:  # would fire on spliced/garbled JSON before the fix
+            results[i] = proc.send({"cmd": "record", "id": f"req-{i}"})["decision_id"]
+        except Exception as e:
             errors.append(e)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(24)]
@@ -246,9 +202,11 @@ def test_sessionproc_send_is_thread_safe_unit():
         t.start()
     for t in threads:
         t.join()
-    assert not errors, errors
-    assert all(results[i] == f"req-{i}" for i in range(24))  # each got ITS OWN response
-    assert proc._p.max_inside == 1                            # never two in the transaction
+    try:
+        assert not errors, errors[:3]
+        assert all(results[i] == f"req-{i}" for i in range(24))  # each got ITS OWN response
+    finally:
+        proc.close()
 
 
 def test_concurrent_records_on_real_bridge_session():
@@ -312,3 +270,136 @@ def test_concurrent_checks_and_records_experimental_bridge():
     assert len(r.decisions) == 12
     assert len({d.id for d in r.decisions}) == 12
     assert r.success is True
+
+
+# ---- transport timeout (regression: a hung bridge must not wedge callers) -------------------
+
+class _FakeBridge:
+    """A controllable stand-in for `ark-bridge --session`. In hang mode it never produces a
+    response, so the reader's readline blocks until the process is killed (then returns EOF)."""
+
+    def __init__(self, hang=False):
+        self._hang = hang
+        self._out = queue.Queue()
+        self._killed = threading.Event()
+        self._alive = True
+        self.kill_count = 0
+        self.stdin = _FakeBridge._In(self)
+        self.stdout = _FakeBridge._Out(self)
+        self.stderr = io.BytesIO(b"")
+
+    def poll(self):
+        return None if self._alive else -9
+
+    def kill(self):
+        self.kill_count += 1
+        self._alive = False
+        self._killed.set()
+
+    def wait(self, timeout=None):
+        if not self._killed.wait(timeout):
+            raise subprocess.TimeoutExpired("bridge", timeout)
+        return -9
+
+    class _In:
+        def __init__(self, p):
+            self.p = p
+            self.closed = False
+
+        def write(self, payload):
+            if self.p._hang:
+                return
+            cmd = _json.loads(payload.decode())
+            self.p._out.put((_json.dumps({"ok": True, "decision_id": cmd.get("id", "d")}) + "\n").encode())
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+            self.p._killed.set()
+
+    class _Out:
+        def __init__(self, p):
+            self.p = p
+
+        def readline(self):
+            while True:
+                try:
+                    return self.p._out.get(timeout=0.02)
+                except queue.Empty:
+                    if self.p._killed.is_set():
+                        return b""
+
+
+def _attach(fake, timeout):
+    proc = _SessionProc(binary="unused", timeout=timeout)
+    proc._p = fake
+    proc._responses = queue.Queue()
+    proc._dead = False
+    proc._reader = threading.Thread(target=proc._read_loop, args=(fake,), daemon=True)
+    proc._reader.start()
+    return proc
+
+
+def test_send_normal_response_via_reader():
+    proc = _attach(_FakeBridge(hang=False), timeout=2)
+    try:
+        assert proc.send({"cmd": "record", "id": "abc"})["decision_id"] == "abc"
+        assert proc.send({"cmd": "record", "id": "def"})["decision_id"] == "def"  # serial reuse
+    finally:
+        proc.close()
+
+
+def test_send_times_out_kills_process_and_marks_unusable():
+    fake = _FakeBridge(hang=True)
+    proc = _attach(fake, timeout=0.3)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(ArkBridgeError) as ei:
+            proc.send({"cmd": "record", "id": "x"})
+        dt = time.monotonic() - t0
+        assert 0.25 <= dt < 3.0, dt                    # near the 0.3s timeout, not 120s or instant
+        assert "timed out" in str(ei.value)
+        assert fake.kill_count >= 1                     # the hung process was terminated
+        # a subsequent send fails cleanly instead of consuming a stale/late response
+        with pytest.raises(ArkBridgeError):
+            proc.send({"cmd": "record", "id": "y"})
+    finally:
+        proc.close()                                    # close() is safe after a timeout
+
+
+def test_close_is_safe_after_timeout():
+    fake = _FakeBridge(hang=True)
+    proc = _attach(fake, timeout=0.2)
+    with pytest.raises(ArkBridgeError):
+        proc.send({"cmd": "record", "id": "x"})
+    proc.close()          # must not raise
+    proc.close()          # idempotent
+
+
+def test_concurrent_callers_do_not_hang_when_first_request_hangs():
+    fake = _FakeBridge(hang=True)
+    proc = _attach(fake, timeout=0.3)
+    results = []
+
+    def worker():
+        try:
+            proc.send({"cmd": "record", "id": "z"})
+            results.append("ok")
+        except ArkBridgeError:
+            results.append("err")
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    t0 = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    dt = time.monotonic() - t0
+    try:
+        assert all(not t.is_alive() for t in threads)   # nobody stuck forever
+        assert dt < 4.0, dt                             # bounded: one timeout, the rest fail fast
+        assert results.count("err") == 4                # all raised cleanly, none got a response
+    finally:
+        proc.close()
