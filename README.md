@@ -17,7 +17,7 @@ pip install ark-agent-runtime
 from ark import ARK
 ```
 
-This is alpha software, version 0.1.0a1.
+This is alpha software, version 0.1.0a2.
 
 ## Why ARK
 
@@ -199,7 +199,7 @@ When ARK runs the workload itself with `ark.run`, it also routes each step to a 
 
 ## Alpha
 
-Version 0.1.0a1. The API can still change. Supervision is experimental and off by default.
+Version 0.1.0a2. The API can still change. Supervision is experimental and off by default.
 
 ## License
 
