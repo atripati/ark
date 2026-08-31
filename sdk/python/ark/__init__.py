@@ -11,6 +11,7 @@ from typing import Optional
 from .client import ARK
 from .errors import ArkError, ArkBridgeError, ArkSupervisionDisabled
 from .session import RunSession, Verdict
+from .report import format_run
 from .models import (
     RunResult, DecisionRecord, DecisionCost, SupervisionRecord, SupervisionResult,
     Verification, RoutingDecision, ToolDecision, SupervisionSummary, RoutingSummary, ToolSummary,
@@ -34,7 +35,7 @@ def trace(task: str, *, supervision: str = "off", task_type: Optional[str] = Non
 
 
 __all__ = [
-    "ARK", "trace", "RunSession", "Verdict",
+    "ARK", "trace", "RunSession", "Verdict", "format_run",
     "ArkError", "ArkBridgeError", "ArkSupervisionDisabled",
     "RunResult", "DecisionRecord", "DecisionCost", "SupervisionRecord", "SupervisionResult",
     "Verification", "RoutingDecision", "ToolDecision",

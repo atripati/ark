@@ -64,9 +64,32 @@ Use `build_agent(model, tools)` from this module to avoid the LangGraph 1.0 depr
 calls `langchain.agents.create_agent` when available, else `langgraph.prebuilt.create_react_agent`
 (warning silenced). ARK's observation and supervision hooks are verified identical on both.
 
+## Parallel tool calls
+
+LangGraph's `ToolNode` runs a turn's tool calls in a thread pool, so several calls can enter
+one ARK session at the same time. That is handled correctly:
+
+- Concurrent LangGraph calls into a single ARK session are **transport-safe**. ARK holds a
+  per-session lock and serializes the whole request/response transaction on the session
+  protocol, so parallel threads can no longer splice each other's bytes.
+- Because access is serialized, **independent parallel tool calls can be traced** through one
+  session without corrupting it — each call's model/tool decisions are recorded cleanly.
+- **Supervised parallel calls are each gated independently**: every proposed action gets its
+  own `check` → verdict, and every allowed action executes only after its own `ALLOW`.
+
+What ARK does **not** do yet: coordinated **batch / transaction** supervision across several
+simultaneous proposed actions. It does not reason about a group of parallel proposals as one
+unit (for example "allow at most one of these" or "reject the whole batch and replan"). Each
+simultaneous proposal is evaluated on its own against the constraint and shares the
+per-constraint retry counter.
+
+The strongest supported supervision model remains sequential: **one proposed consequential
+action → `check` → execute or reject → agent replan**. Independent or observe-only parallel
+fan-out is safe; coordinated multi-action transactions are simply not a modeled scenario.
+
 ## Scope / limits
 
-Sync graphs (`.invoke(...)`); async/parallel tool fan-out is out of scope. The core SDK has
-no dependency on LangGraph — the integration is imported lazily (a clear install message if
-the extra is missing) and installed via `pip install 'ark-agent-runtime[langgraph]'`. No
-CrewAI / OpenAI-Agents adapter, no `wrap()`.
+Sync graphs (`.invoke(...)`); async graphs are out of scope. The core SDK has no dependency on
+LangGraph — the integration is imported lazily (a clear install message if the extra is
+missing) and installed via `pip install "ark-agent-runtime[langgraph]"`. No CrewAI /
+OpenAI-Agents adapter, no `wrap()`.

@@ -211,6 +211,22 @@ class RunResult:
             providers=_f(d, "providers") or {}, errors=_f(d, "errors"), raw=d,
         )
 
+    def to_dict(self) -> dict:
+        """The canonical run as a plain dict — exactly the JSON the runtime produced."""
+        return dict(self.raw) if self.raw is not None else {}
+
+    def to_json(self, indent: int = 2) -> str:
+        """The canonical run as a JSON string."""
+        import json
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+    def report(self, verbose: bool = False, file=None) -> None:
+        """Print the human-readable ARK report for this run. Same formatter as
+        RunSession.report; per-decision provenance is available via RunSession.report."""
+        import sys
+        from .report import format_run
+        print(format_run(self, verbose=verbose), file=file or sys.stdout)
+
 
 @dataclass(frozen=True)
 class SupervisionResult:

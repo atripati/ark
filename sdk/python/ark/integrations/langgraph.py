@@ -23,7 +23,13 @@ the model to REPLAN. `ark_supervise_tool` uses exactly that; it fakes no interce
 (`create_react_agent`'s `post_model_hook` / `interrupt_before=["tools"]` are alternative
 native gates; the tool wrapper is the thinnest and works with any graph.)
 
-Sync graphs only (the common `.invoke(...)` path); async/parallel tool fan-out is out of scope.
+Parallel tool calls: LangGraph's ToolNode runs a turn's tools in a thread pool, so several may
+hit one ARK session at once. That is transport-safe — ARK serializes access to the single
+session, so the thread pool cannot corrupt it, and independent parallel calls trace cleanly.
+Supervised parallel calls are each gated independently (one check/verdict per proposal, sharing
+the per-constraint retry counter). ARK does not yet do coordinated batch/transaction supervision
+across several simultaneous proposals; the strongest supported model stays sequential: one
+proposed action -> check -> execute/reject -> replan. Async graphs are out of scope.
 """
 from __future__ import annotations
 

@@ -2,13 +2,17 @@
 decisions, optionally gates actions, and receives the canonical RunResult with the full
 proposal -> supervision -> retry -> execution -> outcome -> cost chain.
 """
+import io
+import json as _json
 import math
+import threading
+import time
 
 import pytest
 
 import ark
 from ark import ARK, ArkSupervisionDisabled, RunResult
-from ark.session import Verdict
+from ark.session import Verdict, _SessionProc
 
 
 def approx(a, b):
@@ -173,3 +177,138 @@ def test_providers_report_status_not_secrets():
     blob = str(r.raw).lower()
     for bad in ("sk-proj", "sk-ant", "ghp_", "bearer ", "authorization:", "api_key="):
         assert bad not in blob
+
+
+# ---- transport concurrency (regression for the LangGraph ToolNode thread-pool corruption) --
+
+class _FakeProc:
+    """A stand-in bridge with ONE shared response slot. If send() were not fully serialized, a
+    second thread would overwrite the slot between the first thread's write and its readline,
+    so the first thread would read the wrong response. A sleep widens that window. Also tracks
+    the peak number of threads inside a transaction, which must be 1 once the lock is in place.
+    """
+
+    def __init__(self):
+        self._pending = None
+        self.inside = 0
+        self.max_inside = 0
+        self.stdin = _FakeProc._In(self)
+        self.stdout = _FakeProc._Out(self)
+        self.stderr = io.BytesIO(b"")
+
+    def poll(self):
+        return None
+
+    class _In:
+        def __init__(self, p):
+            self.p = p
+            self.closed = False
+
+        def write(self, payload):
+            cmd = _json.loads(payload.decode())
+            self.p.inside += 1
+            self.p.max_inside = max(self.p.max_inside, self.p.inside)
+            time.sleep(0.002)
+            self.p._pending = (_json.dumps({"ok": True, "decision_id": cmd["id"]}) + "\n").encode()
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    class _Out:
+        def __init__(self, p):
+            self.p = p
+
+        def readline(self):
+            time.sleep(0.002)
+            out = self.p._pending
+            self.p.inside -= 1
+            return out
+
+
+def test_sessionproc_send_is_thread_safe_unit():
+    # deterministic, no bridge: proves the lock serializes the whole write+read transaction.
+    proc = _SessionProc(binary="unused")
+    proc._p = _FakeProc()
+    results, errors = {}, []
+
+    def worker(i):
+        try:
+            r = proc.send({"cmd": "record", "id": f"req-{i}"})
+            results[i] = r["decision_id"]
+        except Exception as e:  # would fire on spliced/garbled JSON before the fix
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(24)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert all(results[i] == f"req-{i}" for i in range(24))  # each got ITS OWN response
+    assert proc._p.max_inside == 1                            # never two in the transaction
+
+
+def test_concurrent_records_on_real_bridge_session():
+    # real ark-bridge --session hit from many threads: the exact pattern that corrupted the
+    # pipe under LangGraph. After the fix: no errors, unique/valid ids, finish() works.
+    n_threads, per = 8, 8
+    errors = []
+    with ark.trace("concurrency stress") as run:
+        def worker():
+            for _ in range(per):
+                try:
+                    run.record(action="tool_call", tool="t", model="gpt-4o-mini",
+                               input_tokens=10, output_tokens=2, outcome="success")
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors[:3]
+    r = run.result
+    total = n_threads * per
+    ids = [d.id for d in r.decisions]
+    assert len(ids) == total
+    assert len(set(ids)) == total                                       # unique
+    assert sorted(ids) == [f"decision_{i:03d}" for i in range(1, total + 1)]  # valid/sequential
+    assert r.success is True
+    assert all(d.model == "gpt-4o-mini" for d in r.decisions)
+
+
+def test_concurrent_checks_and_records_experimental_bridge():
+    ev = {"requested_rank": 2, "evidence_complete": True,
+          "options": [{"id": "A", "price": 100}, {"id": "B", "price": 200}]}
+    errors = []
+    with ARK(supervision="experimental").trace("mixed concurrency") as run:
+        def check_worker():
+            try:
+                v = run.check(proposed_action={"option": "B"}, constraint="rank",
+                              evidence=ev, tool="book")
+                if v.verdict != "ALLOW":
+                    errors.append(f"unexpected verdict {v.verdict}")
+            except Exception as e:
+                errors.append(e)
+
+        def record_worker():
+            try:
+                run.record(action="complete", model="gpt-4o", input_tokens=5, output_tokens=1)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=check_worker if i % 2 else record_worker)
+                   for i in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors[:3]
+    r = run.result
+    assert len(r.decisions) == 12
+    assert len({d.id for d in r.decisions}) == 12
+    assert r.success is True

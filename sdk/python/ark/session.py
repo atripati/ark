@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import threading
 from typing import Any, Optional
 
 from .bridge import _find_binary
@@ -57,6 +59,10 @@ class _SessionProc:
         self._bin = binary or _find_binary()
         self._timeout = timeout
         self._p: Optional[subprocess.Popen] = None
+        # one line-protocol pipe, so the whole write/flush/readline transaction must be
+        # atomic. LangGraph runs tools (and thus check/record) from a thread pool; without
+        # this lock concurrent callers splice each other's bytes and corrupt the JSON.
+        self._io_lock = threading.Lock()
 
     def start(self) -> None:
         self._p = subprocess.Popen(
@@ -65,18 +71,23 @@ class _SessionProc:
         )
 
     def send(self, cmd: dict) -> dict:
-        if self._p is None or self._p.poll() is not None:
-            raise ArkBridgeError("session process is not running")
         payload = (json.dumps(cmd) + "\n").encode()
-        try:
-            self._p.stdin.write(payload)
-            self._p.stdin.flush()
-            out = self._p.stdout.readline()
-        except (OSError, BrokenPipeError) as e:
-            raise ArkBridgeError(f"session transport failed: {e}") from e
-        if not out:
-            err = (self._p.stderr.read() or b"")[:300].decode(errors="replace")
-            raise ArkBridgeError(f"session ended without a response: {err}")
+        # Serialize the ENTIRE request/response, not just the write: one request goes out and
+        # exactly one response line is read back before any other thread may touch the pipe.
+        # This only guarantees protocol integrity for concurrent callers; it does not add
+        # parallel-action semantics. Go stays authoritative for verdicts/retry/decision ids.
+        with self._io_lock:
+            if self._p is None or self._p.poll() is not None:
+                raise ArkBridgeError("session process is not running")
+            try:
+                self._p.stdin.write(payload)
+                self._p.stdin.flush()
+                out = self._p.stdout.readline()
+            except (OSError, BrokenPipeError) as e:
+                raise ArkBridgeError(f"session transport failed: {e}") from e
+            if not out:
+                err = (self._p.stderr.read() or b"")[:300].decode(errors="replace")
+                raise ArkBridgeError(f"session ended without a response: {err}")
         try:
             data = json.loads(out.decode())
         except json.JSONDecodeError as e:
@@ -86,19 +97,23 @@ class _SessionProc:
         return data
 
     def close(self) -> None:
-        if self._p is None:
-            return
-        try:
-            if self._p.stdin and not self._p.stdin.closed:
-                self._p.stdin.close()
-            self._p.wait(timeout=5)
-        except Exception:
+        # take the same lock so we never close stdin while a send() is mid-transaction. This
+        # does not nest inside send() (finish() sends, then __exit__ calls close()), so it
+        # cannot deadlock; a concurrent in-flight send simply completes first.
+        with self._io_lock:
+            if self._p is None:
+                return
             try:
-                self._p.kill()
+                if self._p.stdin and not self._p.stdin.closed:
+                    self._p.stdin.close()
+                self._p.wait(timeout=5)
             except Exception:
-                pass
-        finally:
-            self._p = None
+                try:
+                    self._p.kill()
+                except Exception:
+                    pass
+            finally:
+                self._p = None
 
 
 class RunSession:
@@ -224,6 +239,15 @@ class RunSession:
         """Per-decision {reported:[...], derived:[...]} split — which facts came from your
         runtime vs which ARK generated. Available after the trace finishes."""
         return self._provenance
+
+    def report(self, verbose: bool = False, file=None) -> None:
+        """Print a human-readable report of this run. Quiet by default: nothing is printed
+        unless you call this. Built entirely from the canonical RunResult (no parallel schema,
+        no invented fields); reported vs ARK-derived facts stay distinguishable, and in verbose
+        mode the per-decision provenance is shown. Available after the trace finishes."""
+        from .report import format_run
+        print(format_run(self.result, verbose=verbose, provenance=self._provenance),
+              file=file or sys.stdout)
 
 
 def _as_proposed(p: Any) -> dict:

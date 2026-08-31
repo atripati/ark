@@ -209,3 +209,56 @@ def test_end_to_end_supervised_full_chain():
     assert r.supervision.enabled and r.supervision.by_verdict == {"REJECT": 1, "ALLOW": 1}
     # cost still comes only from model turns; supervision added no pricing of its own
     assert approx(sum(d.cost.total_cost for d in r.decisions if d.model), r.total_cost)
+
+
+# ---- regression: LangGraph ToolNode parallel fan-out must not corrupt the session pipe ----
+
+class _ParallelToolModel(BaseChatModel):
+    """Turn 1 emits N tool calls at once so LangGraph's ToolNode runs them in a thread pool
+    (the exact condition that spliced the session pipe before the transport lock). Turn 2 ends.
+    """
+    def __init__(self, n=5, **kw):
+        super().__init__(**kw)
+        object.__setattr__(self, "_n", n)
+        object.__setattr__(self, "_turn", 0)
+
+    @property
+    def _llm_type(self):
+        return "parallel"
+
+    def bind_tools(self, tools, **kw):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kw):
+        i = self._turn
+        object.__setattr__(self, "_turn", i + 1)
+        if i == 0:
+            calls = [{"name": "ping", "args": {"n": str(k)}, "id": f"c{k}"} for k in range(self._n)]
+            m = AIMessage(content="", tool_calls=calls,
+                          usage_metadata={"input_tokens": 50, "output_tokens": 8, "total_tokens": 58},
+                          response_metadata={"model_name": "gpt-4o-mini"})
+        else:
+            m = AIMessage(content="done",
+                          usage_metadata={"input_tokens": 60, "output_tokens": 4, "total_tokens": 64},
+                          response_metadata={"model_name": "gpt-4o-mini"})
+        return ChatResult(generations=[ChatGeneration(message=m)])
+
+
+@tool
+def ping(n: str) -> str:
+    """A trivial tool used to force parallel tool execution."""
+    return f"pong {n}"
+
+
+def test_parallel_tool_fanout_does_not_corrupt_session():
+    agent = build_agent(_ParallelToolModel(n=6), [ping])
+    with ark.trace("parallel fanout") as run:
+        agent.invoke({"messages": [("user", "ping six times")]},
+                     config={"callbacks": [ArkCallbackHandler(run)]})
+    r = run.result
+    assert r.success is True                                  # no ArkBridgeError, no corruption
+    tool_decisions = [d for d in r.decisions if d.tool == "ping"]
+    assert len(tool_decisions) == 6                           # all 6 parallel tools recorded
+    ids = [d.id for d in r.decisions]
+    assert len(set(ids)) == len(ids)                          # ids stayed unique/valid
+    r.report()                                               # the report renders cleanly too
