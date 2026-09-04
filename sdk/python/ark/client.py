@@ -23,11 +23,13 @@ from .session import RunSession
 
 
 class ARK:
-    def __init__(self, supervision: str = "off", bridge=None):
+    def __init__(self, supervision: str = "off", bridge=None, providers: dict = None):
         if supervision not in ("off", "experimental"):
             raise ValueError("supervision must be 'off' or 'experimental'")
         self.supervision = supervision
         self._bridge = bridge or SubprocessBridge()
+        # trusted evidence providers, configured by the application — never by the agent.
+        self._providers: dict = dict(providers or {})
 
     def run(self, task: Optional[str] = None, agent: Any = None, *,
             mode: str = "mock", config: Optional[str] = None) -> RunResult:
@@ -45,6 +47,11 @@ class ARK:
             req["config"] = config
         return RunResult.from_dict(self._bridge.call(req))
 
+    def bridge_info(self) -> dict:
+        """Probe the bridge's compatibility contract: {protocol_version, capabilities, bridge}.
+        Used to verify a freshly installed wheel bundles a hardened, matching bridge."""
+        return self._bridge.call({"kind": "hello"})
+
     def trace(self, task: str, *, task_type: Optional[str] = None,
               provider: str = "openai", budget: int = 4) -> RunSession:
         """Open an external-agent trace: keep your own agent/model/tools and attach ARK
@@ -59,7 +66,7 @@ class ARK:
         enables run.check(...). ARK never executes your agent — you do.
         """
         return RunSession(task, task_type=task_type, supervision=self.supervision,
-                          provider=provider, budget=budget)
+                          provider=provider, budget=budget, providers=self._providers)
 
     def supervise(self, constraint: str, proposed: dict, evidence: dict,
                   retry_count: int = 0, budget: int = 4) -> SupervisionResult:

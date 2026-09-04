@@ -59,10 +59,17 @@ func runSupervise() {
 func evalOne(sup *supervise.Supervisor, raw []byte) supervise.Decision {
 	var req supervise.Request
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return supervise.Decision{Verdict: supervise.Allow,
-			Reason: "unparseable request; failing open to ALLOW: " + err.Error()}
+		// FAIL CLOSED: an unparseable request must never authorize execution. Emit a
+		// non-ALLOW, non-executing decision (empty verdict) with the parse error as the reason.
+		return supervise.Decision{Verdict: "",
+			Reason: "unparseable supervision request; refusing (fail closed): " + err.Error()}
 	}
-	return sup.Evaluate(req)
+	d, err := sup.Evaluate(req)
+	if err != nil {
+		// Unknown/misconfigured constraint: fail closed, never ALLOW.
+		return supervise.Decision{Verdict: "", Reason: err.Error(), Audit: d.Audit}
+	}
+	return d
 }
 
 func emit(w io.Writer, d supervise.Decision) {

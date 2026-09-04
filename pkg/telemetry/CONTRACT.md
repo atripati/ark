@@ -10,7 +10,8 @@ Run (RunResult)
         ├── model            (model + routing_reason)
         ├── tool/action      (tool + redacted tool_args_ref)
         ├── verification     (method, passed, score, confidence, issues)
-        ├── supervision      (constraint, verdict, evidence ref, retry, executed)
+        ├── supervision      (constraint, scope, verdict, proposed+fingerprint,
+        │                     evidence ref/fingerprint/source/version/observed_at, retry, executed)
         ├── outcome          (outcome, error, executed)
         └── cost             (tokens, input/output/model/tool cost, total, latency)
 ```
@@ -62,11 +63,25 @@ Builder never reads governor state. A future SDK can expose both, distinctly.
 
 The graduated constrained-supervision mechanism (`pkg/supervise`, experimental, off by
 default) is not a separate observability universe. A supervised action is one `DecisionRecord`
-whose `supervision` block records the constraint, the verdict
-(`ALLOW`/`REJECT`/`REQUIRE_EVIDENCE`/`RECOVERY_EXHAUSTED`), a **reference** to the trusted
-evidence (never the raw bag), the retry number, and whether it executed. A reject→retry→allow
-chain is a sequence of distinct decisions; ARK still never authors the action — the suggested
-option is evidence, and the agent re-proposes.
+whose `supervision` block records the constraint, the **scope** it was bound to, the verdict
+(`ALLOW`/`REJECT`/`REQUIRE_EVIDENCE`/`RECOVERY_EXHAUSTED`), the proposed option/kind and a
+**fingerprint** of the exact proposed action, a **reference + content fingerprint** of the
+trusted evidence together with its provenance (`evidence_source`, `evidence_version`,
+`evidence_observed_at_unix`) — never the raw bag — the retry number, and whether it executed.
+The evidence reference is the caller's `evidence_id` when supplied, else the content
+fingerprint (never a constant placeholder), so an auditor can tie a verdict to the exact
+evidence state that produced it. A reject→retry→allow chain is a sequence of distinct
+decisions; ARK still never authors the action — the suggested option is evidence, and the agent
+re-proposes. Supervision fails **closed**: an unknown constraint or malformed evidence is
+refused (an error), never recorded as an `ALLOW`.
+
+The block also carries the **authorization lifecycle** for a consequential action:
+`transaction_id` (the retry-isolated lifecycle), the proposing `agent_id` (on the DecisionRecord),
+a REDACTED view of the proposed parameters (`proposed_fields_redacted`, secret-like keys masked),
+`evidence_expires_at_unix`, the `auth_state` (`ISSUED`→`CONSUMED`→`COMPLETED`), a stable
+`idempotency_key`, and `issued_at_unix`/`consumed_at_unix`/`executed_at_unix` — each stamped at
+its real event time (UTC), not at run finish. Together these make a consequential authorization
+reconstructable from telemetry alone without leaking secrets.
 
 ## Security / telemetry hygiene
 

@@ -43,15 +43,23 @@ def main():
 
         proposed = my_agent_first_choice()
         for attempt in range(5):                        # your loop; ARK bounds it via the verdict
-            v = run.check(proposed_action={"option": proposed}, constraint="rank",
-                          evidence=EVIDENCE, action="tool_call", tool="book")
+            action = {"option": proposed}
+            v = run.check(proposed_action=action, constraint="rank", evidence=EVIDENCE,
+                          scope="booking-1", transaction="booking-1", action="tool_call", tool="book")
             print(f"attempt {attempt}: proposed={proposed} -> {v.verdict}"
                   + (f" (suggested={v.suggested})" if v.suggested else ""))
             if v.allowed:
-                # your framework executes the booking; then you report it on THIS decision
+                # PRE-EXECUTION gate: re-validate freshness/replay/action right before executing.
+                cleared = run.consume(v, executed_action=action)
+                if not cleared.cleared:
+                    print("authorization stale before execution — re-checking:", cleared.reason)
+                    proposed = my_agent_first_choice()   # fetch fresh evidence + re-propose
+                    continue
+                # your framework executes the booking (forward cleared.idempotency_key to the API);
+                # then you report it on THIS decision with the actual executed action.
                 run.record(action="tool_call", tool="book", model="gpt-4o",
                            input_tokens=882, output_tokens=186, latency_ms=1400,
-                           outcome="success", of=v)
+                           outcome="success", of=v, executed_action=action)
                 break
             if v.verdict == "RECOVERY_EXHAUSTED":
                 print("recovery budget spent — not executing")

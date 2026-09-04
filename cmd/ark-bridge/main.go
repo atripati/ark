@@ -44,11 +44,13 @@ type request struct {
 	Supervision string `json:"supervision"` // "off" (default) | "experimental"
 
 	// supervise:
-	Constraint string                   `json:"constraint"`
-	Proposed   supervise.ProposedAction `json:"proposed"`
-	Evidence   supervise.Evidence       `json:"evidence"`
-	RetryCount int                      `json:"retry_count"`
-	Budget     int                      `json:"budget"`
+	Constraint        string                   `json:"constraint"`
+	Scope             string                   `json:"scope"`
+	Proposed          supervise.ProposedAction `json:"proposed"`
+	Evidence          json.RawMessage          `json:"evidence"` // decoded strictly (fail-closed)
+	RetryCount        int                      `json:"retry_count"`
+	Budget            int                      `json:"budget"`
+	MaxEvidenceAgeSec int64                    `json:"max_evidence_age_sec"`
 }
 
 func main() {
@@ -73,6 +75,8 @@ func runOneShot() {
 		return
 	}
 	switch req.Kind {
+	case "hello":
+		emitJSON(helloReply()) // capability probe (one-shot): `echo '{"kind":"hello"}' | ark-bridge`
 	case "run":
 		handleRun(req)
 	case "supervise":
@@ -89,19 +93,41 @@ func handleSupervise(req request) {
 		emitErr("constrained supervision is experimental and off by default; pass supervision=experimental")
 		return
 	}
+	sup := supervise.New()
+	// Fail closed on an unknown constraint — never authorize under a constraint we do not implement.
+	if !sup.Has(req.Constraint) {
+		emitErr("unknown constraint '" + req.Constraint + "': ARK fails closed and will not authorize under a constraint it does not implement")
+		return
+	}
+	// Strict evidence decode + validation (fail loud, never coerce to ALLOW-producing zero values).
+	ev, verr := decodeEvidenceStrict(sup, req.Evidence, req.Constraint)
+	if verr != nil {
+		emitErr("malformed evidence: " + verr.Error())
+		return
+	}
 	budget := req.Budget
 	if budget == 0 {
 		budget = 4
 	}
-	d := supervise.New().Evaluate(supervise.Request{
-		Constraint: req.Constraint, Proposed: req.Proposed, Evidence: req.Evidence,
+	d, err := sup.Evaluate(supervise.Request{
+		Constraint: req.Constraint, Scope: req.Scope, Proposed: req.Proposed, Evidence: ev,
 		RetryCount: req.RetryCount, Budget: budget,
+		NowUnix:   time.Now().Unix(),
+		Freshness: supervise.FreshnessPolicy{MaxAgeSec: req.MaxEvidenceAgeSec, SkewSec: clockSkewSec},
 	})
+	if err != nil {
+		emitErr("supervision refused (fail closed): " + err.Error())
+		return
+	}
+	evRef := ev.Meta.EvidenceID
+	if evRef == "" {
+		evRef = d.Audit.EvidenceFingerprint
+	}
 	emitJSON(map[string]any{
 		"kind":        "supervision",
 		"verdict":     string(d.Verdict),
 		"reason":      d.Reason,
-		"supervision": telemetry.SupervisionFromDecision(d, "inline_evidence"),
+		"supervision": telemetry.SupervisionFromDecision(d, evRef),
 	})
 }
 

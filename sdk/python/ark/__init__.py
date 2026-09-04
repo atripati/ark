@@ -9,8 +9,8 @@ savings): it exposes the factual telemetry the Go runtime already produces.
 from typing import Optional
 
 from .client import ARK
-from .errors import ArkError, ArkBridgeError, ArkSupervisionDisabled
-from .session import RunSession, Verdict
+from .errors import ArkError, ArkBridgeError, ArkSupervisionDisabled, ArkSupervisionError, ArkProviderError
+from .session import RunSession, Verdict, Cleared
 from .report import format_run
 from .models import (
     RunResult, DecisionRecord, DecisionCost, SupervisionRecord, SupervisionResult,
@@ -19,7 +19,7 @@ from .models import (
 
 
 def trace(task: str, *, supervision: str = "off", task_type: Optional[str] = None,
-          provider: str = "openai", budget: int = 4) -> RunSession:
+          provider: str = "openai", budget: int = 4, providers: Optional[dict] = None) -> RunSession:
     """Open an external-agent trace with a default client. Keep your own agent/model/tools
     and attach ARK around your runtime:
 
@@ -30,15 +30,15 @@ def trace(task: str, *, supervision: str = "off", task_type: Optional[str] = Non
 
     Pass supervision="experimental" to enable run.check(...) gating.
     """
-    return ARK(supervision=supervision).trace(task, task_type=task_type,
-                                              provider=provider, budget=budget)
+    return ARK(supervision=supervision, providers=providers).trace(task, task_type=task_type,
+                                                                   provider=provider, budget=budget)
 
 
 __all__ = [
-    "ARK", "trace", "RunSession", "Verdict", "format_run",
-    "ArkError", "ArkBridgeError", "ArkSupervisionDisabled",
+    "ARK", "trace", "RunSession", "Verdict", "Cleared", "format_run",
+    "ArkError", "ArkBridgeError", "ArkSupervisionDisabled", "ArkSupervisionError", "ArkProviderError",
     "RunResult", "DecisionRecord", "DecisionCost", "SupervisionRecord", "SupervisionResult",
     "Verification", "RoutingDecision", "ToolDecision",
     "SupervisionSummary", "RoutingSummary", "ToolSummary",
 ]
-__version__ = "0.1.0a1"
+__version__ = "0.1.0rc1"

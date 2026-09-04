@@ -7,7 +7,7 @@ Keep your agent.
 Keep your tools.
 Add ARK around the runtime.
 
-ARK sits around the decisions an agent makes. It records what happened and what it cost. With experimental supervision turned on, it can also check a proposed tool action before that action runs.
+ARK sits between an agent's proposed consequential tool action and its execution. Before the action runs, ARK validates it against the runtime constraint that applies and the trusted evidence you provide, then returns one of `ALLOW`, `REJECT`, `REQUIRE_EVIDENCE`, or `RECOVERY_EXHAUSTED`. Only an allowed action runs. ARK does not author the replacement action. The agent remains the author.
 
 ```bash
 pip install ark-agent-runtime
@@ -17,13 +17,13 @@ pip install ark-agent-runtime
 from ark import ARK
 ```
 
-This is alpha software, version 0.1.0a1.
+Release-candidate software, version 0.1.0rc1. Supervision is experimental and off by default.
 
 ## Why ARK
 
 An agent can know a rule and still propose the wrong tool call. Once that call runs, explaining it correctly afterward does not undo the side effect. The booking already happened. The row was already written.
 
-ARK sits at that point, just before the call runs. It gives the runtime a place to look at the proposed action, the rule that applies, and the trusted evidence, and then decide whether the call goes through.
+ARK sits at that point, just before the call runs. It gives the runtime a place to look at the proposed action, the constraint that applies, and the trusted evidence, and then decide whether the call goes through.
 
 ```
 agent proposes an action
@@ -42,7 +42,11 @@ agent proposes an action
 pip install ark-agent-runtime
 ```
 
-The wheel ships with the Go runtime bridge for your platform. You do not need Go installed, the source repo, `PYTHONPATH`, or `ARK_BRIDGE_BIN`. The import stays `from ark import ARK`.
+```python
+from ark import ARK
+```
+
+The core SDK has zero runtime Python dependencies and is tested in CI on Python 3.9 through 3.14. The wheel ships with the Go runtime bridge for your platform, so you do not need Go installed, the source repo, `PYTHONPATH`, or `ARK_BRIDGE_BIN`. The import stays `from ark import ARK`.
 
 ## Two ways to use ARK
 
@@ -80,23 +84,6 @@ print(result.total_cost, [d.model for d in result.decisions])
 
 This is the mode that matters if you already have an agent. ARK never runs your model. You do.
 
-## Observability
-
-Every run returns a `RunResult` with a list of decisions. A decision can carry:
-
-- model and provider
-- input and output tokens
-- cost, which ARK works out from the tokens and model when you do not pass a cost yourself
-- the tool or proposed action, and its outcome
-- verification, when your runtime reports it
-- a supervision verdict, when supervision is on
-- a stable id, so a proposed action and the action that actually ran can point to the same decision
-- latency, when it is available
-
-Run totals include total cost, total tokens, and cost grouped by model, by tool, and by action.
-
-Not every provider returns every field. Fields that are missing stay empty. ARK does not fill them in. `run.provenance` tells you, per decision, which facts your runtime reported and which ARK worked out.
-
 ## Runtime supervision (experimental)
 
 Supervision is experimental and off by default. Turn it on with `ARK(supervision="experimental")`.
@@ -110,15 +97,23 @@ The flow:
 5. on a verdict other than ALLOW, the agent gets feedback and decides again
 6. your integration runs the action only after ALLOW
 
-Verdicts are `ALLOW`, `REJECT`, `REQUIRE_EVIDENCE`, and `RECOVERY_EXHAUSTED`.
+| verdict | meaning |
+|---|---|
+| `ALLOW` | the action satisfies the constraint, or no constraint applies |
+| `REJECT` | the action provably violates the constraint |
+| `REQUIRE_EVIDENCE` | the constraint applies but the evidence is not enough to validate |
+| `RECOVERY_EXHAUSTED` | the retry budget is spent and the action is still unsatisfied |
 
 ```python
 from ark import ARK
 
 with ARK(supervision="experimental").trace("book a flight") as run:
+    action = {"option": "B"}
     verdict = run.check(
-        proposed_action={"option": "A"},
+        proposed_action=action,
         constraint="rank",
+        scope="booking-42",         # the resource/entity affected
+        transaction="booking-42",   # one authorization lifecycle (retry is isolated per transaction)
         evidence={
             "requested_rank": 2,
             "evidence_complete": True,
@@ -127,15 +122,28 @@ with ARK(supervision="experimental").trace("book a flight") as run:
         tool="book",
     )
     if verdict.allowed:
-        ...  # run the tool
+        # PRE-EXECUTION gate: re-validate freshness/replay/action right before the side effect.
+        cleared = run.consume(verdict, executed_action=action)
+        if cleared.cleared:
+            ...  # run the tool now, forwarding cleared.idempotency_key to a cooperating API
+            run.record(of=verdict, executed=True, executed_action=action,
+                       model="gpt-4o", input_tokens=..., output_tokens=...)
+        else:
+            ...  # stale before use — gather fresh evidence and re-check; do NOT execute
     else:
-        # the agent reads the verdict and the feedback, then proposes the next action itself
+        # the agent reads the verdict and feedback, then proposes the next action itself
         ...
 ```
 
-The agent stays the author. ARK returns a verdict and feedback grounded in the evidence. It does not write the next action. The agent reads that feedback and decides what to do next.
+`scope` names the resource, `transaction` names one authorization lifecycle (retry budgets are isolated per transaction). On ALLOW, call `consume(...)` immediately before the side effect: it re-checks freshness, replay, and the exact action at *use* time and consumes the authorization once — execute only when `cleared.cleared` is true. `record(...)` requires the actual `executed_action` and matches it to what ARK authorized. The agent stays the author. ARK returns a verdict and feedback grounded in the evidence; it does not write the next action.
 
-Supervision is not a correctness guarantee. It does not make an agent safe, and it does not catch every bad action. It gives the runtime one place to check a proposed action against a rule and trusted evidence before the action runs.
+Boundaries (precise): ARK enforces this only for actions routed through the supervised path (`check` → `consume` → execute → `record`); a developer can bypass it by calling an unwrapped tool directly. ARK does not prove the supplied evidence is true, is not an OS-level security boundary, and cannot guarantee an external API executed only once unless that API honors the forwarded idempotency key. ARK provides **single-consumption authorization**, not "exactly-once execution": it prevents reuse of the same authorization through the supervised path; duplicate *external* execution additionally depends on the target system's idempotency semantics. `agent_id`/`transaction_id`/`scope` are identifiers supplied by the integration — bound and audited, but not authenticated by ARK.
+
+Trusted evidence: the agent authors the proposed action; an application-configured `EvidenceProvider` (which the agent cannot select, replace, edit, or downgrade) establishes the facts through a separate trust channel; ARK deterministically checks the action against them. Evidence is trust-classified (`TRUSTED_PROVIDER` / `CALLER_SUPPLIED` / `AGENT_SUPPLIED`), and a protected constraint only ALLOWs on `TRUSTED_PROVIDER` evidence bound to the exact request/subject/tenant — so `check(action, evidence=agent_output)` can never authorize a protected action; only `check(action, provider="billing")` can. Precise claim: **ARK separates agent-authored proposals from evidence obtained through application-configured trust channels and binds authorization to that evidence deterministically — it does not prove the facts are true** (a provider can itself be wrong/compromised). No LLM judges evidence.
+
+Durability: by default authorization state is in-memory (lost on process exit; an old authorization then fails closed). Set `ARK_AUTHZ_DIR=<dir>` to enable the durable store — the `ISSUED → CONSUMED` transition is then atomic and single-winner across restarts, crashes, and multiple ARK instances sharing that directory, retry-exhaustion survives restart, and a store failure fails closed. After a crash, a CONSUMED authorization whose outcome is unknown is reported as AMBIGUOUS for reconciliation — never silently retried.
+
+Supervision is not a correctness guarantee. It does not make an agent safe, and it does not catch every bad action. It gives the runtime one place to check a proposed consequential action against a constraint and trusted evidence before the action runs.
 
 ## LangGraph
 
@@ -149,57 +157,110 @@ pip install "ark-agent-runtime[langgraph]"
 from ark.integrations.langgraph import ArkCallbackHandler, ark_supervise_tool
 ```
 
-To observe, pass `ArkCallbackHandler(run)` in the callbacks and ARK records the model and tool decisions from LangChain's callback events.
+The extra requires Python >=3.10 (LangChain and LangGraph 1.x declare `requires-python >=3.10`) and is tested in CI on Python 3.10 through 3.14. Core ARK on 3.9 is unaffected; only the LangGraph extra needs 3.10+.
 
-To supervise, wrap a tool with `ark_supervise_tool(run, tool, constraint=..., evidence=...)`. Before the real tool runs, ARK checks the proposed action. On a verdict other than ALLOW the tool does not run, and ARK returns feedback grounded in the evidence as the tool result. LangGraph feeds that back to the model, and the model decides what to do next.
+To observe, pass `ArkCallbackHandler(run)` in the callbacks and ARK records the model and tool decisions from LangChain's callback events. To supervise, wrap a tool with `ark_supervise_tool(run, tool, constraint=..., evidence=...)`: before the real tool runs, ARK checks the proposed action, and on a verdict other than ALLOW the tool does not run and ARK returns evidence-grounded feedback as the tool result, which LangGraph feeds back to the model.
 
-In a live run with a real OpenAI model:
+### Verified authorship, live with a real OpenAI model
 
-- the model proposed action A
-- ARK rejected A before its side effect
-- the feedback went back to LangGraph
-- the model proposed action B
-- ARK allowed B
-- only B ran
+```
+model proposes A
+   -> ARK REJECT
+   -> A does not execute
+   -> feedback returns to the model
+   -> model proposes B
+   -> ARK ALLOW
+   -> only B executes
+```
 
-ARK did not write action B. The model did. This shows the mechanism can supervise a real external agent framework while the agent keeps authorship. It does not show that ARK improves every LangGraph agent.
+B was authored by the model, not generated by ARK. This shows the mechanism can supervise a real external agent framework while the agent keeps authorship. It does not show that ARK improves every LangGraph agent.
 
-## Evidence
+## Reporting and observability
 
-Two separate results.
+Every run returns a canonical `RunResult`. A decision can carry the model and provider, input and output tokens, cost (which ARK derives from tokens and model when you do not pass one), the tool or proposed action and its outcome, a supervision verdict, executed state, retry number, latency, and a stable id that links a proposed action to the action that ran. Run totals include total cost, total tokens, and cost grouped by model, by tool, and by action. Missing fields stay empty; ARK does not fill them in.
 
-**A scoped benchmark.** In a paired K=16 tau bench airline evaluation, on one constrained recovery failure class, ARK raised task success from 6.25% to 81.25%, which is 1 of 16 up to 13 of 16.
+```python
+run.report()               # readable summary of the run
+run.report(verbose=True)   # adds per-decision evidence and reported-vs-derived provenance
+result = run.result
+result.to_dict()           # the canonical RunResult as a dict
+result.to_json()           # the canonical RunResult as JSON
+```
 
-| supervision | tasks passed |
-|-------------|--------------|
-| OFF         | 1 of 16      |
-| ON          | 13 of 16     |
+`report()` prints run status, the model and tool decisions in order, costs and tokens, supervision verdicts, executed state, and retries. `verbose=True` adds the evidence behind each verdict and, from the trace session, the provenance of each fact (what your runtime reported versus what ARK derived). `result.report()` prints the same summary when you only have the `RunResult`.
 
-This is one constrained recovery failure class in the tau bench airline research environment. tau bench airline is a research benchmark, not an airline. It is not a general reliability result. It does not mean ARK improves all agents, and it does not solve hallucinations. In the same evaluation there were nine directly attributable recoveries and zero observed regressions, rank was satisfied on all 16 of 16 trials, and there were zero false rejects and zero evidence leakage.
+`cost_by_supervision` is the cost of decisions that carry a supervision verdict. It is not necessarily ARK's causal incremental overhead.
 
-**A real external agent.** The LangGraph live run above shows the same mechanism working around a real agent framework while the model keeps authorship.
+## Concurrency and transport
 
-One result proves a mechanism on a scoped benchmark failure class. The other proves the mechanism can supervise a real external framework. They are different claims.
+The runtime session transport is serialized per session, so concurrent callers cannot interleave on the single line protocol. This is tested with parallel LangGraph tool fan-out. A verified six-way parallel fan-out produced six concurrent tool decisions with unique decision ids, a successful run, and no JSON corruption.
 
-## Supported platforms
+A deliberately hung bridge is subject to a bounded timeout: the process is terminated, and the dead session then refuses further calls rather than consuming a stale or late response as the answer to a later command.
 
-CI builds a wheel for each of these and fresh installs it in a clean environment outside the repo:
+## Platforms and fresh install
 
-- macOS Apple Silicon (arm64)
-- macOS Intel (x86_64)
+All five platform wheels are built and fresh-installed in CI, each carrying the bundled Go runtime bridge:
+
+- macOS arm64
+- macOS x86_64
 - Linux x86_64
 - Linux arm64
 - Windows x86_64
 
-Each wheel carries the Go bridge for its platform.
+The release candidate was installed into a clean environment outside the source repo, with `PYTHONPATH` and `ARK_BRIDGE_BIN` unset. There ARK imported from site-packages, the bundled bridge was discovered automatically and executed `ARK().run()`, the canonical `RunResult` telemetry came back, cost reconciliation passed, `ark.trace()` worked, and supervision stayed off by default.
+
+## Python compatibility
+
+| package | Python | notes |
+|---|---|---|
+| core `ark-agent-runtime` | 3.9 to 3.14 | zero runtime dependencies, tested in CI |
+| `[langgraph]` extra | 3.10 to 3.14 | LangChain and LangGraph 1.x require >=3.10 |
+
+## Evidence
+
+Two separate results, held to their own scope.
+
+### A scoped benchmark: tau-bench airline, K=16
+
+Paired evaluation on one constrained recovery failure class.
+
+| supervision | tasks passed | rate |
+|---|---|---|
+| OFF | 1 of 16 | 6.25% |
+| ON | 13 of 16 | 81.25% |
+
+That is +75 percentage points, with nine directly attributable recoveries and zero observed regressions. Rank was satisfied on all 16 of 16 trials, with zero false rejects and zero evidence leakage.
+
+Scope: this is one constrained recovery failure class in the tau-bench airline research environment. tau-bench airline is a research benchmark, not an airline. It is not evidence that ARK improves every agent or every workload, and it does not solve hallucinations.
+
+### A small local paired evaluation
+
+A small local paired mechanism and regression check over five action-validation cases. OFF passed 0 of 5 and ON passed 5 of 5.
+
+| classification | count |
+|---|---|
+| ARK recovery (a non-ALLOW intervention, then ALLOW) | 5 |
+| safe no-op (ON correct with no intervention) | 0 |
+| ARK regression (OFF passed, ON failed) | 0 |
+| failed recovery (both failed) | 0 |
+| unattributed ON win | 0 |
+
+Every one of the five ON successes contained an actual non-ALLOW intervention followed by a later ALLOW, so all five are attributable and none are unattributed. Case 4, for example, went REJECT, REJECT, REJECT, then ALLOW. This is a small local mechanism and regression check, not the headline benchmark, and not a general 100% reliability claim.
+
+### How recoveries are attributed
+
+An OFF-fail with an ON-pass is counted as an ARK recovery only when a non-ALLOW ARK intervention precedes a later successful ALLOW. An ON win with no intervention is classified as unattributed, not credited to ARK.
+
+## Safety of claims
+
+- Supervision is experimental and off by default.
+- ARK is not a correctness guarantee.
+- ARK does not solve hallucinations in general.
+- The evidence here applies to scoped action-validation workloads, not to arbitrary agents or tasks.
 
 ## Also in ARK
 
-When ARK runs the workload itself with `ark.run`, it also routes each step to a model and can run structural checks on code output, such as compile and lint. Those show up in the same telemetry. They are secondary to the observability and supervision story above.
-
-## Alpha
-
-Version 0.1.0a1. The API can still change. Supervision is experimental and off by default.
+When ARK runs the workload itself with `ark.run`, it also routes each step to a model and can run structural checks on code output, such as compile and lint. These appear in the same telemetry and are secondary to the supervision and observability story above.
 
 ## License
 

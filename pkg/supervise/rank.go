@@ -11,25 +11,44 @@ type RankConstraint struct{}
 
 func (RankConstraint) Name() string { return "rank" }
 
-// Applicable: a rank preference must have been expressed (RequestedRank >= 1).
-func (RankConstraint) Applicable(_ ProposedAction, e Evidence) bool {
-	return e.RequestedRank >= 1
+// Applicable: whenever a caller routes an action through the rank constraint, rank governs it,
+// so it always APPLIES. Presence and validity of requested_rank is enforced by ValidateEvidence
+// (at the trust boundary) and by Validate — a missing/invalid rank must FAIL CLOSED
+// (error / REQUIRE_EVIDENCE), never silently ALLOW via an "inapplicable" determination.
+func (RankConstraint) Applicable(_ ProposedAction, _ Evidence) Applicability { return Applies }
+
+// ValidateEvidence declares rank's required fields, co-located with the constraint (satisfies
+// EvidenceValidator). A rank check without a valid requested_rank is malformed configuration.
+func (RankConstraint) ValidateEvidence(e Evidence) error {
+	if e.RequestedRank < 1 {
+		return fmt.Errorf("the rank constraint requires requested_rank >= 1 (got %d)", e.RequestedRank)
+	}
+	return nil
 }
 
-// Validate mirrors the frozen research predicate (post filter-fix):
-//   - connecting/other options are relevant unless the request is nonstop-only, so an
-//     incomplete option set yields REQUIRE_EVIDENCE;
-//   - build the candidate set from ALL options (filtered to direct-only iff nonstop-only);
-//   - if the requested rank cannot be established from the evidence, ALLOW (do not block on
-//     insufficient/degenerate evidence — the mechanism never invents an answer);
-//   - if the proposed option's price tier == the requested rank, ALLOW;
+// Validate mirrors the frozen research predicate, hardened to fail closed:
+//   - requested_rank must be >= 1, else REQUIRE_EVIDENCE (a missing rank is not "no preference");
+//   - the relevant candidate set must be asserted complete (for both general and nonstop-only
+//     requests), else REQUIRE_EVIDENCE — a rank cannot be verified against a partial set;
+//   - build candidates from the options (filtered to direct-only iff nonstop-only);
+//   - if the rank cannot be established from the evidence (no candidates, rank exceeds the
+//     established tiers, the proposed option is absent or unpriceable) -> REQUIRE_EVIDENCE.
+//     ARK never ALLOWs merely because verification failed, and never invents the answer;
+//   - if the proposed option's price tier == the requested rank -> ALLOW;
 //   - otherwise REJECT, returning the runtime-derived rank-N option id as evidence.
 func (RankConstraint) Validate(p ProposedAction, e Evidence) (Verdict, string, string) {
 	n := e.RequestedRank
-
-	if !e.NonstopOnly && !e.EvidenceComplete {
+	if n < 1 {
 		return RequireEvidence,
-			"a price-ranked option was requested, but the option set is incomplete; gather the remaining options, then re-propose the requested rank",
+			"the rank constraint requires requested_rank >= 1, but none was provided; supply the requested rank as trusted evidence",
+			""
+	}
+
+	// A rank over a price-ordered set can only be verified against the COMPLETE relevant set.
+	// Without an explicit completeness assertion, ARK cannot prove the proposal is rank-N.
+	if !e.EvidenceComplete {
+		return RequireEvidence,
+			"the candidate set is not asserted complete; gather the complete relevant option set (all direct options when nonstop-only), then re-propose the requested rank",
 			""
 	}
 
@@ -41,17 +60,28 @@ func (RankConstraint) Validate(p ProposedAction, e Evidence) (Verdict, string, s
 		cands = append(cands, o)
 	}
 	if len(cands) == 0 {
-		return Allow, "no rankable candidates in the evidence; cannot verify rank", ""
+		return RequireEvidence,
+			"no rankable candidates in the evidence; cannot verify the requested rank",
+			""
 	}
 
 	tiers := distinctSortedPrices(cands)
 	if n > len(tiers) {
-		return Allow, fmt.Sprintf("requested rank %d exceeds %d retrieved price tiers", n, len(tiers)), ""
+		return RequireEvidence,
+			fmt.Sprintf("requested rank %d exceeds the %d distinct price tiers established by the evidence; gather more candidates or correct the rank", n, len(tiers)),
+			""
 	}
 
 	pp, ok := priceOfOption(p.Option, e.Options)
-	if !ok || indexOfPrice(tiers, pp) < 0 {
-		return Allow, "proposed option is not priceable from the retrieved evidence; cannot verify rank", ""
+	if !ok {
+		return RequireEvidence,
+			fmt.Sprintf("proposed option %q is absent from the retrieved evidence; cannot verify its rank", p.Option),
+			""
+	}
+	if indexOfPrice(tiers, pp) < 0 {
+		return RequireEvidence,
+			fmt.Sprintf("proposed option %q is not priceable within the candidate tiers; cannot verify its rank", p.Option),
+			""
 	}
 
 	proposedRank := indexOfPrice(tiers, pp) + 1

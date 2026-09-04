@@ -96,7 +96,9 @@ def _verbose_lines(d, provenance: Optional[dict]) -> List[str]:
         if val is not None and val != "" and val != []:
             out.append(f"        {label}: {val}")
 
-    add("timestamp", d.timestamp)
+    add("timestamp", d.timestamp)  # the decision's actual time (verdict/check time for a supervised decision)
+    if d.supervision and d.supervision.executed_at_unix:
+        add("executed at (unix)", d.supervision.executed_at_unix)
     add("routing reason", d.routing_reason)
     add("tool args", d.tool_args_ref)
     c = d.cost
@@ -107,9 +109,32 @@ def _verbose_lines(d, provenance: Optional[dict]) -> List[str]:
     sup = d.supervision
     if sup:
         add("constraint", sup.applicable_constraint)
+        add("scope", sup.scope)
+        add("transaction", sup.transaction_id)
+        if d.agent_id:
+            add("agent", d.agent_id)
+        add("proposed", sup.proposed_option or sup.proposed_kind)
+        add("proposed params", sup.proposed_fields_redacted)  # secret-like keys already masked
+        add("proposed fingerprint", sup.proposed_fingerprint)
         add("rejection reason", sup.rejection_reason)
         add("suggested evidence", sup.suggested_from_evidence)
-        add("trusted evidence ref", sup.trusted_evidence_ref)
+        add("evidence trust", sup.evidence_trust)
+        add("evidence provider", sup.evidence_provider_id)
+        add("evidence subject", sup.evidence_subject)
+        add("evidence ref", sup.trusted_evidence_ref)
+        add("evidence fingerprint", sup.evidence_fingerprint)
+        add("evidence source", sup.evidence_source)
+        add("evidence version", sup.evidence_version)
+        if sup.evidence_observed_at_unix:
+            add("evidence observed_at", sup.evidence_observed_at_unix)
+        if sup.evidence_expires_at_unix:
+            add("evidence expires_at", sup.evidence_expires_at_unix)
+        add("auth state", sup.auth_state)
+        add("idempotency key", sup.idempotency_key)
+        if sup.issued_at_unix:
+            add("issued at (unix)", sup.issued_at_unix)
+        if sup.consumed_at_unix:
+            add("consumed at (unix)", sup.consumed_at_unix)
     v = d.verification
     if v:
         add("verification", f"method={v.method} passed={v.passed} score={v.score}")

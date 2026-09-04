@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
@@ -29,14 +30,17 @@ func contains(xs []string, want string) bool {
 	return false
 }
 
-func rankEvidence() supervise.Evidence {
-	return supervise.Evidence{
+// rankEvidenceRaw is the trusted evidence as the transport carries it: a raw JSON payload,
+// so check() exercises the STRICT decode path (as a real Python caller would drive it).
+func rankEvidenceRaw() json.RawMessage {
+	b, _ := json.Marshal(supervise.Evidence{
 		RequestedRank: 2, EvidenceComplete: true,
 		Options: []supervise.Option{
 			{ID: "A", Price: 163, IsDirect: true},
 			{ID: "B", Price: 290, IsDirect: true},
 		},
-	}
+	})
+	return b
 }
 
 // The whole point of the session process: retry state + verdict semantics are authoritative
@@ -45,14 +49,14 @@ func TestSessionRetryAuthoritativeInGo(t *testing.T) {
 	s := newExtSession(sessionCmd{Task: "book", Supervision: "experimental", Budget: 3})
 	want := []string{"REJECT", "REJECT", "REJECT", "RECOVERY_EXHAUSTED"}
 	for i, w := range want {
-		r := s.check(sessionCmd{Action: "tool_call", Tool: "book", Constraint: "rank",
-			Proposed: supervise.ProposedAction{Option: "A"}, Evidence: rankEvidence()})
+		r := s.check(sessionCmd{Action: "tool_call", Tool: "book", Constraint: "rank", Scope: "txn-1",
+			Proposed: supervise.ProposedAction{Option: "A"}, Evidence: rankEvidenceRaw()})
 		if got := r["verdict"]; got != w {
 			t.Fatalf("check %d: verdict=%v, want %v", i, got, w)
 		}
 	}
-	if s.retry["rank"] != 4 {
-		t.Fatalf("retry counter=%d, want 4", s.retry["rank"])
+	if n, _ := s.store.RetryCount(retryKey("txn-1", "rank")); n != 4 {
+		t.Fatalf("retry counter=%d, want 4", n)
 	}
 }
 
@@ -68,20 +72,24 @@ func TestSessionCheckOffByDefault(t *testing.T) {
 func TestSessionFullChainRejectThenAllow(t *testing.T) {
 	s := newExtSession(sessionCmd{Task: "book 2nd cheapest", Supervision: "experimental", Provider: "openai"})
 
-	r1 := s.check(sessionCmd{Action: "tool_call", Tool: "book", Constraint: "rank",
-		Proposed: supervise.ProposedAction{Option: "A"}, Evidence: rankEvidence()})
+	r1 := s.check(sessionCmd{Action: "tool_call", Tool: "book", Constraint: "rank", Scope: "txn-1",
+		Proposed: supervise.ProposedAction{Option: "A"}, Evidence: rankEvidenceRaw()})
 	if r1["verdict"] != "REJECT" || r1["suggested"] != "B" {
 		t.Fatalf("first check: %v", r1)
 	}
-	r2 := s.check(sessionCmd{Action: "tool_call", Tool: "book", Constraint: "rank",
-		Proposed: supervise.ProposedAction{Option: "B"}, Evidence: rankEvidence()})
+	r2 := s.check(sessionCmd{Action: "tool_call", Tool: "book", Constraint: "rank", Scope: "txn-1",
+		Proposed: supervise.ProposedAction{Option: "B"}, Evidence: rankEvidenceRaw()})
 	if r2["verdict"] != "ALLOW" || r2["allowed"] != true {
 		t.Fatalf("second check: %v", r2)
 	}
 	allowID, _ := r2["decision_id"].(string)
 	in, out := 882, 186
-	s.record(sessionCmd{Action: "tool_call", Tool: "book", Model: "gpt-4o",
-		InputTokens: in, OutputTokens: out, Of: allowID})
+	rr := s.record(sessionCmd{Action: "tool_call", Tool: "book", Model: "gpt-4o",
+		InputTokens: in, OutputTokens: out, Of: allowID,
+		ExecutedAction: &supervise.ProposedAction{Option: "B"}}) // MANDATORY: the executed action
+	if rr["error"] != nil {
+		t.Fatalf("recording the authorized action must succeed: %v", rr)
+	}
 
 	fr := s.finish(sessionCmd{Success: true, Output: "booked B"})
 	run := runResultOf(t, fr)

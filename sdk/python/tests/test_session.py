@@ -89,16 +89,17 @@ def test_full_supervised_chain_reject_then_allow():
           "options": [{"id": "A", "price": 163, "is_direct": True},
                       {"id": "B", "price": 290, "is_direct": True}]}
     with ARK(supervision="experimental").trace(task="book 2nd-cheapest", task_type="booking") as run:
-        v1 = run.check(proposed_action={"option": "A"}, constraint="rank", evidence=ev, tool="book")
+        v1 = run.check(proposed_action={"option": "A"}, constraint="rank", evidence=ev, scope="order-1", tool="book")
         assert isinstance(v1, Verdict)
         assert v1.verdict == "REJECT" and v1.allowed is False
         assert v1.suggested == "B" and v1.retry_number == 0
 
-        v2 = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, tool="book")
+        v2 = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, scope="order-1", tool="book")
         assert v2.verdict == "ALLOW" and v2.allowed is True
         assert v2.retry_number == 1                      # retry state advanced IN GO
         run.record(action="tool_call", tool="book", model="gpt-4o",
-                   input_tokens=882, output_tokens=186, of=v2)
+                   input_tokens=882, output_tokens=186, of=v2,
+                   executed_action={"option": "B"})     # MANDATORY: the actual executed action
 
     r = run.result
     # decision_001 = rejected proposal (not executed, no cost); decision_002 = allowed+executed
@@ -123,7 +124,7 @@ def test_retry_budget_recovery_exhausted_is_authoritative_in_go():
     verdicts = []
     with ARK(supervision="experimental").trace(task="book", budget=3) as run:
         for _ in range(6):
-            v = run.check(proposed_action={"option": "A"}, constraint="rank", evidence=ev, tool="book")
+            v = run.check(proposed_action={"option": "A"}, constraint="rank", evidence=ev, scope="order-1", tool="book")
             verdicts.append(v.verdict)
             if v.verdict == "RECOVERY_EXHAUSTED":
                 break
@@ -135,9 +136,10 @@ def test_of_verdict_links_execution_to_proposal():
     ev = {"requested_rank": 2, "evidence_complete": True,
           "options": [{"id": "A", "price": 163}, {"id": "B", "price": 290}]}
     with ARK(supervision="experimental").trace(task="book") as run:
-        v = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, tool="book")
+        v = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, scope="order-1", tool="book")
         did = run.record(action="tool_call", tool="book", model="gpt-4o",
-                         input_tokens=100, output_tokens=20, of=v)
+                         input_tokens=100, output_tokens=20, of=v,
+                         executed_action={"option": "B"})
     assert did == v.decision_id                         # same decision, unambiguous chain
     assert len(run.result.decisions) == 1
 
@@ -147,7 +149,7 @@ def test_of_verdict_links_execution_to_proposal():
 def test_check_requires_experimental_supervision():
     with ark.trace(task="x") as run:  # supervision defaults off
         with pytest.raises(ArkSupervisionDisabled):
-            run.check(proposed_action={"option": "A"}, constraint="rank", evidence={})
+            run.check(proposed_action={"option": "A"}, constraint="rank", evidence={}, scope="order-1")
 
 
 def test_result_unavailable_before_finish():
@@ -247,7 +249,7 @@ def test_concurrent_checks_and_records_experimental_bridge():
         def check_worker():
             try:
                 v = run.check(proposed_action={"option": "B"}, constraint="rank",
-                              evidence=ev, tool="book")
+                              evidence=ev, scope="order-1", tool="book")
                 if v.verdict != "ALLOW":
                     errors.append(f"unexpected verdict {v.verdict}")
             except Exception as e:

@@ -63,15 +63,53 @@ class SupervisionRecord:
     retry_number: Optional[int] = None
     suggested_from_evidence: Optional[str] = None
     executed: Optional[bool] = None
+    # hardened audit fields (present when the runtime records them; None otherwise)
+    scope: Optional[str] = None
+    transaction_id: Optional[str] = None
+    proposed_option: Optional[str] = None
+    proposed_kind: Optional[str] = None
+    proposed_fingerprint: Optional[str] = None
+    proposed_fields_redacted: Optional[str] = None
+    evidence_fingerprint: Optional[str] = None
+    evidence_source: Optional[str] = None
+    evidence_version: Optional[str] = None
+    evidence_observed_at_unix: Optional[int] = None
+    evidence_expires_at_unix: Optional[int] = None
+    # trusted-evidence plane
+    evidence_trust: Optional[str] = None
+    evidence_provider_id: Optional[str] = None
+    evidence_subject: Optional[str] = None
+    evidence_request_fingerprint: Optional[str] = None
+    # authorization lifecycle
+    auth_state: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    issued_at_unix: Optional[int] = None
+    consumed_at_unix: Optional[int] = None
+    executed_at_unix: Optional[int] = None  # distinct from the verdict time
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> Optional["SupervisionRecord"]:
         if not d:
             return None
         return cls(
-            _f(d, "applicable_constraint"), _f(d, "verdict"), _f(d, "trusted_evidence_ref"),
-            _f(d, "rejection_reason"), _f(d, "retry_number"), _f(d, "suggested_from_evidence"),
-            _f(d, "executed"),
+            applicable_constraint=_f(d, "applicable_constraint"), verdict=_f(d, "verdict"),
+            trusted_evidence_ref=_f(d, "trusted_evidence_ref"),
+            rejection_reason=_f(d, "rejection_reason"), retry_number=_f(d, "retry_number"),
+            suggested_from_evidence=_f(d, "suggested_from_evidence"), executed=_f(d, "executed"),
+            scope=_f(d, "scope"), transaction_id=_f(d, "transaction_id"),
+            proposed_option=_f(d, "proposed_option"),
+            proposed_kind=_f(d, "proposed_kind"), proposed_fingerprint=_f(d, "proposed_fingerprint"),
+            proposed_fields_redacted=_f(d, "proposed_fields_redacted"),
+            evidence_fingerprint=_f(d, "evidence_fingerprint"), evidence_source=_f(d, "evidence_source"),
+            evidence_version=_f(d, "evidence_version"),
+            evidence_observed_at_unix=_f(d, "evidence_observed_at_unix"),
+            evidence_expires_at_unix=_f(d, "evidence_expires_at_unix"),
+            evidence_trust=_f(d, "evidence_trust"), evidence_provider_id=_f(d, "evidence_provider_id"),
+            evidence_subject=_f(d, "evidence_subject"),
+            evidence_request_fingerprint=_f(d, "evidence_request_fingerprint"),
+            auth_state=_f(d, "auth_state"), idempotency_key=_f(d, "idempotency_key"),
+            issued_at_unix=_f(d, "issued_at_unix"), consumed_at_unix=_f(d, "consumed_at_unix"),
+            executed_at_unix=_f(d, "executed_at_unix"),
         )
 
 
@@ -96,6 +134,7 @@ class DecisionRecord:
     decision_type: str
     timestamp: Optional[str] = None
     action: Optional[str] = None
+    agent_id: Optional[str] = None
     model: Optional[str] = None
     routing_reason: Optional[str] = None
     tool: Optional[str] = None
@@ -124,7 +163,8 @@ class DecisionRecord:
     def from_dict(cls, d: dict) -> "DecisionRecord":
         return cls(
             id=d["id"], sequence=d["sequence"], decision_type=d["decision_type"],
-            timestamp=_f(d, "timestamp"), action=_f(d, "action"), model=_f(d, "model"),
+            timestamp=_f(d, "timestamp"), action=_f(d, "action"), agent_id=_f(d, "agent_id"),
+            model=_f(d, "model"),
             routing_reason=_f(d, "routing_reason"), tool=_f(d, "tool"), tool_args_ref=_f(d, "tool_args_ref"),
             cost=DecisionCost.from_dict(_f(d, "cost")), latency_ms=_f(d, "latency_ms", 0),
             verification=Verification.from_dict(_f(d, "verification")),

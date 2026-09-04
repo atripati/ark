@@ -33,29 +33,46 @@ def _ensure_executable(path: str) -> None:
         pass
 
 
+_NO_BRIDGE_MSG = (
+    "ark-bridge binary not found. An installed `ark-agent-runtime` wheel bundles a matching "
+    "bridge automatically. From a source checkout, build one and point ARK_BRIDGE_BIN at it: "
+    "`go build -o ark-bridge-bin ./cmd/ark-bridge && export ARK_BRIDGE_BIN=$PWD/ark-bridge-bin`."
+)
+
+
+def _resolve_binary(override: "str | None", bundled: "str | None", path_bridge: "str | None") -> "str | None":
+    """Pure binary-resolution priority (kept separate so it is directly testable):
+
+      1. explicit ARK_BRIDGE_BIN override (developer/operator intent — validated by the handshake)
+      2. the bridge bundled inside the installed wheel (the release-correct path)
+      3. an `ark-bridge` deliberately installed on PATH (development/ops convenience)
+      else: None (caller raises)
+
+    Invariant: an accidental stale developer binary is NEVER auto-preferred over the bundled
+    release bridge — the bundled bridge outranks PATH, and there are no machine-specific ~/… guesses.
+    """
+    if override:
+        return override
+    if bundled:
+        return bundled
+    if path_bridge:
+        return path_bridge
+    return None
+
+
 def _find_binary() -> str:
-    # 1. explicit override — for developers/debugging (not needed by an installed package)
-    b = os.environ.get("ARK_BRIDGE_BIN")
-    if b and os.path.exists(b):
-        return b
-    # 2. the bundled bridge inside the installed wheel — the normal path, zero setup
+    override = os.environ.get("ARK_BRIDGE_BIN") or None
+    if override and not os.path.exists(override):
+        # an explicit override that does not exist is a loud error — never silently fall back to a
+        # different (possibly stale) bridge than the operator asked for.
+        raise ArkBridgeError(f"ARK_BRIDGE_BIN points to a missing file: {override}")
     bundled = _bundled_binary()
     if bundled:
         _ensure_executable(bundled)
-        return bundled
-    # 3. a bridge on PATH, then a source-checkout build (developer convenience)
-    p = shutil.which("ark-bridge")
-    if p:
-        return p
-    for guess in (os.path.expanduser("~/ark/ark-bridge-bin"),
-                  os.path.expanduser("~/ark/ark-bridge-test-bin")):
-        if os.path.exists(guess):
-            return guess
-    raise ArkBridgeError(
-        "ark-bridge binary not found. An installed `ark-agent-runtime` wheel bundles it "
-        "automatically; if you are running from a source checkout, build it with "
-        "`go build -o ark-bridge-bin ./cmd/ark-bridge` and set ARK_BRIDGE_BIN."
-    )
+    chosen = _resolve_binary(override, bundled, shutil.which("ark-bridge"))
+    if chosen is None:
+        raise ArkBridgeError(_NO_BRIDGE_MSG)
+    return chosen
 
 
 class SubprocessBridge:

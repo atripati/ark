@@ -22,8 +22,39 @@ import threading
 from typing import Any, Optional
 
 from .bridge import _find_binary
-from .errors import ArkError, ArkBridgeError, ArkSupervisionDisabled
+from .errors import ArkError, ArkBridgeError, ArkSupervisionDisabled, ArkSupervisionError, ArkProviderError
 from .models import RunResult
+from . import providers as _providers
+
+# Bridge<->SDK compatibility contract. The SDK refuses to run against a bridge that does not
+# advertise a compatible protocol AND every capability whose guarantee the SDK relies on — so a
+# stale/mismatched bridge fails LOUDLY instead of silently degrading supervision.
+PROTOCOL_VERSION = 1
+REQUIRED_CAPABILITIES = frozenset({
+    "supervision", "action_binding", "consume", "authorization_id",
+    "namespace", "transaction_isolation", "freshness", "trusted_provider",
+})
+
+
+def check_bridge_compat(reply: dict) -> None:
+    """Raise ArkBridgeError unless the bridge advertises a compatible protocol + capabilities."""
+    pv = reply.get("protocol_version")
+    caps = set(reply.get("capabilities") or [])
+    if pv is None or not caps:
+        raise ArkBridgeError(
+            "ark-bridge did not advertise a protocol version/capabilities — it is STALE or "
+            "incompatible with this SDK. An installed `ark-agent-runtime` wheel bundles a matching "
+            "bridge; in a source checkout, build a fresh one and set ARK_BRIDGE_BIN.")
+    if pv != PROTOCOL_VERSION:
+        raise ArkBridgeError(
+            f"ark-bridge protocol version {pv} is incompatible with this SDK (expects "
+            f"{PROTOCOL_VERSION}); reinstall/rebuild a matching bridge.")
+    missing = REQUIRED_CAPABILITIES - caps
+    if missing:
+        raise ArkBridgeError(
+            "ark-bridge is missing required capabilities: " + ", ".join(sorted(missing)) +
+            ". It is stale/incompatible and supervision would be weaker than this SDK assumes — "
+            "refusing to run. Rebuild/reinstall the bridge.")
 
 
 class Verdict:
@@ -42,10 +73,36 @@ class Verdict:
         self.retry_number: Optional[int] = d.get("retry_number")
         self.suggested: Optional[str] = d.get("suggested") or None
         self.allowed: bool = bool(d.get("allowed"))
+        self.scope: Optional[str] = d.get("scope") or None
+        self.transaction_id: Optional[str] = d.get("transaction_id") or None
+        # the stable, durable authorization id — usable to consume/record across restart and
+        # across ARK instances. Also serves as the idempotency key a cooperating external API can
+        # honour to dedupe the real side effect (ARK does not own that side effect).
+        self.authorization_id: Optional[str] = d.get("authorization_id") or None
+        self.idempotency_key: Optional[str] = d.get("idempotency_key") or d.get("authorization_id") or None
+        # fingerprints binding this verdict to the exact action + evidence it evaluated.
+        self.action_fingerprint: Optional[str] = d.get("action_fingerprint") or None
+        self.evidence_fingerprint: Optional[str] = d.get("evidence_fingerprint") or None
 
     def __repr__(self) -> str:
         return (f"Verdict(verdict={self.verdict!r}, allowed={self.allowed}, "
-                f"suggested={self.suggested!r}, id={self.decision_id!r})")
+                f"suggested={self.suggested!r}, txn={self.transaction_id!r}, id={self.decision_id!r})")
+
+
+class Cleared:
+    """Result of the PRE-EXECUTION :meth:`RunSession.consume` gate. Execute the side effect ONLY
+    when ``cleared`` is True. When False, the authorization went stale before use (re-check with
+    fresh evidence). ``idempotency_key`` may be forwarded to a cooperating external API."""
+
+    def __init__(self, d: dict):
+        self.cleared: bool = bool(d.get("cleared"))
+        self.decision_id: Optional[str] = d.get("decision_id")
+        self.idempotency_key: Optional[str] = d.get("idempotency_key")
+        self.requires_recheck: bool = bool(d.get("requires_recheck"))
+        self.reason: Optional[str] = d.get("reason")
+
+    def __repr__(self) -> str:
+        return f"Cleared(cleared={self.cleared}, id={self.decision_id!r}, reason={self.reason!r})"
 
 
 class _SessionProc:
@@ -172,7 +229,7 @@ class RunSession:
 
     def __init__(self, task: str, *, task_type: Optional[str] = None, supervision: str = "off",
                  provider: str = "openai", budget: int = 4, run_id: Optional[str] = None,
-                 transport: Optional[_SessionProc] = None):
+                 transport: Optional[_SessionProc] = None, providers: Optional[dict] = None):
         if supervision not in ("off", "experimental"):
             raise ValueError("supervision must be 'off' or 'experimental'")
         self.task = task
@@ -181,6 +238,8 @@ class RunSession:
         self._supervision = supervision
         self._provider = provider
         self._budget = budget
+        # trusted evidence providers, registered by the application (never the agent). Keyed by name.
+        self._providers: dict = dict(providers or {})
         self._proc = transport or _SessionProc()
         self._result: Optional[RunResult] = None
         self._provenance: Optional[dict] = None
@@ -195,6 +254,11 @@ class RunSession:
             "supervision": self._supervision, "provider": self._provider,
             "budget": self._budget, "run_id": self.run_id or "",
         })
+        try:  # refuse a stale/incompatible bridge BEFORE any supervision is trusted
+            check_bridge_compat(r)
+        except ArkBridgeError:
+            self._proc.close()
+            raise
         self.run_id = r.get("run_id")
         self._started = True
         return self
@@ -211,12 +275,26 @@ class RunSession:
         return False  # never suppress the developer's exception
 
     # -- supervision gate ----------------------------------------------------------
-    def check(self, proposed_action: Any, constraint: str, evidence: dict, *,
-              action: str = "tool_call", tool: Optional[str] = None) -> Verdict:
+    def check(self, proposed_action: Any, constraint: str, evidence: dict = None, *,
+              scope: str, transaction: Optional[str] = None, agent_id: Optional[str] = None,
+              namespace: Optional[str] = None, provider: Optional[str] = None,
+              require_trusted_provider: Optional[bool] = None,
+              action: str = "tool_call", tool: Optional[str] = None,
+              max_evidence_age: Optional[int] = None) -> Verdict:
         """Gate a proposed action BEFORE executing it. Synchronous, non-authoring.
 
-        Returns a :class:`Verdict`. ARK owns the retry budget and verdict semantics; on a
-        non-ALLOW verdict your agent re-authors the next action and calls ``check`` again.
+        ``scope`` (REQUIRED) is the resource/entity affected (e.g. an order/customer id).
+        ``transaction`` identifies ONE authorization lifecycle; retry budgets are isolated per
+        ``(transaction, constraint)`` so two separate transactions for the same entity never
+        share a budget. It defaults to ``scope`` — pass a distinct ``transaction`` per
+        consequential workflow when one entity has several. ``agent_id`` is optional audit
+        metadata naming the logical agent making the proposal.
+
+        ARK FAILS CLOSED: an unknown constraint, a missing scope, or malformed/typo'd evidence
+        raises rather than returning ALLOW. Returns a :class:`Verdict`. On ALLOW, call
+        :meth:`consume` immediately before the side effect (it re-checks freshness/replay at use
+        time); ARK never authors the next action. Optionally set ``max_evidence_age`` (seconds)
+        to require the evidence's ``meta.observed_at_unix`` to be recent, else REQUIRE_EVIDENCE.
         """
         if not self._started:
             raise ArkError("check() outside an open trace")
@@ -224,12 +302,64 @@ class RunSession:
             raise ArkSupervisionDisabled(
                 "constrained supervision is experimental and off by default; "
                 "open the trace with supervision='experimental'")
+        if not isinstance(scope, str) or not scope.strip():
+            raise ArkSupervisionError(
+                "check() requires a non-empty 'scope' identifying the resource/entity being "
+                "supervised")
+        proposed = _as_proposed(proposed_action)
+        require = bool(require_trusted_provider)
+
+        if provider is not None:
+            # TRUSTED path: resolve evidence through the application-configured provider (the agent
+            # cannot select or influence it). A provider that raises fails CLOSED to REQUIRE_EVIDENCE
+            # rather than proceeding.
+            fn = self._providers.get(provider)
+            if fn is None or not callable(fn):
+                raise ArkProviderError(
+                    f"evidence provider {provider!r} is not registered; register it on ARK(providers=...)")
+            req = _providers.build_request(namespace=namespace or "", transaction=transaction or "",
+                                           scope=scope, constraint=constraint, proposed=proposed)
+            try:
+                result = fn(req)
+                ev = _providers.envelope_from_provider(provider, req, result)
+            except Exception as exc:  # provider unavailable/timeout/malformed -> fail closed
+                return Verdict({"verdict": "REQUIRE_EVIDENCE", "allowed": False, "requires_recheck": True,
+                                "reason": f"evidence provider {provider!r} failed ({type(exc).__name__}: {exc}); "
+                                          f"no trusted evidence, refusing"})
+            require = True  # using a provider implies the protected path
+        else:
+            # LEGACY path: directly-supplied evidence is always CALLER_SUPPLIED (never trusted), so
+            # it can never satisfy a protected constraint.
+            ev = _providers.stamp_caller_supplied(evidence)
+
         r = self._proc.send({
             "cmd": "check", "action": action, "tool": tool or "",
-            "constraint": constraint, "proposed": _as_proposed(proposed_action),
-            "evidence": evidence or {},
+            "constraint": constraint, "scope": scope, "namespace": namespace or "",
+            "transaction_id": transaction or "", "agent_id": agent_id or "",
+            "proposed": proposed, "evidence": ev,
+            "max_evidence_age_sec": int(max_evidence_age) if max_evidence_age else 0,
+            "require_trusted_provider": require,
         })
         return Verdict(r)
+
+    def consume(self, of: "Verdict | str", executed_action: Any) -> Cleared:
+        """PRE-EXECUTION gate. Call IMMEDIATELY BEFORE the real side effect, passing the actual
+        structured action you are about to execute. ARK re-validates the authorization against a
+        fresh clock (freshness window still open, verdict still ALLOW, action still matches, not
+        already consumed) and consumes it exactly once. Execute ONLY when the returned
+        :class:`Cleared` has ``cleared is True``; when False the authorization went stale — do
+        NOT execute, re-check with fresh evidence. Hard problems (non-ALLOW, action mismatch,
+        replay, missing action) raise. This is the strong TOCTOU guarantee; a bare check->record
+        still enforces action binding and single-execution but skips this pre-execution re-check.
+        """
+        if not self._started:
+            raise ArkError("consume() outside an open trace")
+        of_id, auth_id = _authrefs(of)
+        r = self._proc.send({
+            "cmd": "consume", "of": of_id, "authorization_id": auth_id,
+            "executed_action": _as_proposed(executed_action) if executed_action is not None else None,
+        })
+        return Cleared(r)
 
     # -- telemetry report ----------------------------------------------------------
     def record(self, *, action: Optional[str] = None, model: Optional[str] = None,
@@ -238,9 +368,17 @@ class RunSession:
                cost: Optional[float] = None, latency_ms: Optional[int] = None,
                routing_reason: Optional[str] = None, verification: Optional[dict] = None,
                outcome: Optional[str] = None, error: Optional[str] = None,
-               executed: bool = True, of: "Verdict | str | None" = None) -> Optional[str]:
+               executed: bool = True, of: "Verdict | str | None" = None,
+               executed_action: Any = None) -> Optional[str]:
         """Report one decision's telemetry. With ``of=<verdict>`` it completes the decision
         that ``check`` created; otherwise it records a fresh (unsupervised) decision.
+
+        When you confirm execution of an ARK authorization (``of=<ALLOW verdict>`` with
+        ``executed=True``), you MUST pass ``executed_action`` — the actual structured action you
+        executed (a bare id, ``{"option": ...}``, or a full ProposedAction dict). ARK
+        canonicalizes it and requires its fingerprint to match the action that received ALLOW;
+        a missing or different action is refused (fail closed). You cannot confirm execution by
+        echoing a fingerprint — you must present the real action.
 
         Everything here is REPORTED by your runtime — ARK derives only ids/ordering and, when
         you give tokens+model but no ``cost``, the cost (via ARK's pricing tables). Pass
@@ -249,7 +387,7 @@ class RunSession:
         """
         if not self._started:
             raise ArkError("record() outside an open trace")
-        of_id = of.decision_id if isinstance(of, Verdict) else of
+        of_id, auth_id = _authrefs(of)
         r = self._proc.send({
             "cmd": "record", "action": action or "", "model": model or "",
             "tool": tool or "", "tool_args": tool_args,
@@ -257,7 +395,8 @@ class RunSession:
             "cost": cost, "latency_ms": latency_ms or 0,
             "routing_reason": routing_reason or "", "verification": verification,
             "outcome": outcome or "", "error": error or "",
-            "executed": executed, "of": of_id or "",
+            "executed": executed, "of": of_id, "authorization_id": auth_id,
+            "executed_action": _as_proposed(executed_action) if executed_action is not None else None,
         })
         return r.get("decision_id")
 
@@ -296,6 +435,21 @@ class RunSession:
         from .report import format_run
         print(format_run(self.result, verbose=verbose, provenance=self._provenance),
               file=file or sys.stdout)
+
+
+def _authrefs(of: "Verdict | str | None") -> "tuple[str, str]":
+    """Resolve an authorization reference into (in-session decision id, stable authorization id).
+
+    Accepts a :class:`Verdict` (carries both — works in-session and across restart/instances), a
+    stable authorization id string (``ark-authz-...`` — works across processes), or a plain
+    decision id string (in-session only)."""
+    if isinstance(of, Verdict):
+        return (of.decision_id or ""), (of.authorization_id or "")
+    if isinstance(of, str):
+        if of.startswith("ark-authz-"):
+            return "", of
+        return of, ""
+    return "", ""
 
 
 def _as_proposed(p: Any) -> dict:

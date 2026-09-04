@@ -47,15 +47,52 @@ type Verification struct {
 
 // Supervision captures a constrained-supervision intervention, if one applied. It mirrors
 // the pkg/supervise verdict semantics; the mechanism never authors the action, so this
-// records only the judgment + a REFERENCE to the trusted evidence (never raw secrets).
+// records only the judgment + structured, safe REFERENCES to the action and evidence it
+// evaluated (fingerprints/ids, never the raw evidence or secrets). An incident responder can
+// reconstruct WHY an action was allowed/blocked from these fields.
 type Supervision struct {
-	ApplicableConstraint  string `json:"applicable_constraint,omitempty"`
-	Verdict               string `json:"verdict,omitempty"` // ALLOW/REJECT/REQUIRE_EVIDENCE/RECOVERY_EXHAUSTED
-	TrustedEvidenceRef    string `json:"trusted_evidence_ref,omitempty"`
+	ApplicableConstraint string `json:"applicable_constraint,omitempty"`
+	Scope                string `json:"scope,omitempty"`          // resource/entity this verdict concerns
+	TransactionID        string `json:"transaction_id,omitempty"` // one consequential authorization lifecycle
+	Verdict              string `json:"verdict,omitempty"`        // ALLOW/REJECT/REQUIRE_EVIDENCE/RECOVERY_EXHAUSTED
+
+	// what was proposed (structured, safe): the opaque option/kind, a fingerprint of the exact
+	// proposed action, and a REDACTED view of its parameters (secret-like keys masked) so an
+	// investigator can read the important parameters without leaking secrets.
+	ProposedOption          string `json:"proposed_option,omitempty"`
+	ProposedKind            string `json:"proposed_kind,omitempty"`
+	ProposedFingerprint     string `json:"proposed_fingerprint,omitempty"`
+	ProposedFieldsRedacted  string `json:"proposed_fields_redacted,omitempty"`
+
+	// which evidence state produced the verdict: a caller id or content fingerprint, plus the
+	// provenance/version/observed-at/expires-at the caller supplied. Never the raw evidence.
+	TrustedEvidenceRef     string `json:"trusted_evidence_ref,omitempty"`
+	EvidenceFingerprint    string `json:"evidence_fingerprint,omitempty"`
+	EvidenceSource         string `json:"evidence_source,omitempty"`
+	EvidenceVersion        string `json:"evidence_version,omitempty"`
+	EvidenceObservedAtUnix int64  `json:"evidence_observed_at_unix,omitempty"`
+	EvidenceExpiresAtUnix  int64  `json:"evidence_expires_at_unix,omitempty"`
+	// trusted-evidence plane: which trust channel the facts came through, and (for a provider)
+	// which provider, which subject/entity, and the request binding — so an auditor can answer
+	// "which trusted provider supplied the facts that allowed this action?".
+	EvidenceTrust        string `json:"evidence_trust,omitempty"`
+	EvidenceProviderID   string `json:"evidence_provider_id,omitempty"`
+	EvidenceSubject      string `json:"evidence_subject,omitempty"`
+	EvidenceRequestFP    string `json:"evidence_request_fingerprint,omitempty"`
+
 	RejectionReason       string `json:"rejection_reason,omitempty"`
 	RetryNumber           *int   `json:"retry_number,omitempty"`
 	SuggestedFromEvidence string `json:"suggested_from_evidence,omitempty"`
 	Executed              *bool  `json:"executed,omitempty"`
+
+	// Authorization lifecycle (ISSUED -> CONSUMED -> COMPLETED), each stamped at its real time.
+	// IdempotencyKey is a stable id for THIS authorization the integration may forward to a
+	// cooperating external API to dedupe the real side effect (ARK does not own that side effect).
+	AuthState      string `json:"auth_state,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	IssuedAtUnix   int64  `json:"issued_at_unix,omitempty"`
+	ConsumedAtUnix int64  `json:"consumed_at_unix,omitempty"`
+	ExecutedAtUnix int64  `json:"executed_at_unix,omitempty"`
 }
 
 // DecisionRecord is one meaningful runtime decision. Fields that do not apply are left
@@ -67,6 +104,11 @@ type DecisionRecord struct {
 
 	DecisionType DecisionType `json:"decision_type"`
 	Action       string       `json:"action,omitempty"`
+
+	// AgentID is a generic identifier for the logical agent that made this proposal. It is
+	// audit metadata only — never an authorization authority by itself — and lets telemetry
+	// distinguish Agent A / B / C in a multi-agent run.
+	AgentID string `json:"agent_id,omitempty"`
 
 	Model         string `json:"model,omitempty"`
 	RoutingReason string `json:"routing_reason,omitempty"`

@@ -24,12 +24,13 @@ def _reject_then_allow_run():
     ev = {"requested_rank": 2, "evidence_complete": True,
           "options": [{"id": "A", "price": 100}, {"id": "B", "price": 200}, {"id": "C", "price": 300}]}
     with ARK(supervision="experimental").trace("book flight", task_type="booking") as run:
-        v1 = run.check(proposed_action={"option": "C"}, constraint="rank", evidence=ev, tool="book")
+        v1 = run.check(proposed_action={"option": "C"}, constraint="rank", evidence=ev, scope="order-1", tool="book")
         run.record(action="tool_call", tool="book", tool_args={"option": "C"},
                    outcome="rejected", executed=False, of=v1)
-        v2 = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, tool="book")
+        v2 = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, scope="order-1", tool="book")
         run.record(action="tool_call", tool="book", tool_args={"option": "B"}, model="gpt-4o",
-                   input_tokens=100, output_tokens=20, outcome="success", of=v2)
+                   input_tokens=100, output_tokens=20, outcome="success", of=v2,
+                   executed_action={"option": "B"})
     return run
 
 
@@ -45,10 +46,10 @@ def test_report_immediate_allow():
     ev = {"requested_rank": 2, "evidence_complete": True,
           "options": [{"id": "A", "price": 100}, {"id": "B", "price": 200}]}
     with ARK(supervision="experimental").trace("book") as run:
-        v = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, tool="book")
+        v = run.check(proposed_action={"option": "B"}, constraint="rank", evidence=ev, scope="order-1", tool="book")
         assert v.allowed
         run.record(action="tool_call", tool="book", model="gpt-4o", input_tokens=100,
-                   output_tokens=20, of=v)
+                   output_tokens=20, of=v, executed_action={"option": "B"})
     txt = format_run(run.result)
     assert "ALLOW" in txt and "executed=True" in txt
     assert "REJECT" not in txt

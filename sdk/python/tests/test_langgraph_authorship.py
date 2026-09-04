@@ -109,9 +109,15 @@ def test_rejected_proposal_returns_feedback_string_not_execution():
     is ARK feedback text (which becomes a ToolMessage the model reads), not an executed action."""
     BOOKED.clear()
     class Spy:
-        def check(self, *, proposed_action, constraint, evidence, action, tool):
-            class V: decision_id="d1"; verdict="REJECT"; allowed=False; reason="rank-2 required"; suggested="B"
+        def check(self, *, proposed_action, constraint, evidence, scope=None, transaction=None,
+                  agent_id=None, action=None, tool=None, max_evidence_age=None):
+            class V:
+                decision_id = "d1"; verdict = "REJECT"; allowed = False
+                reason = "rank-2 required"; suggested = "B"; action_fingerprint = None
             return V()
+        def consume(self, of, executed_action):
+            class _C: cleared = True; reason = None
+            return _C()
         def record(self, **kw): return "d1"
     wrapped = ark_supervise_tool(Spy(), book_flight, constraint="rank", evidence=EV)
     out = wrapped.invoke({"option": "A"})

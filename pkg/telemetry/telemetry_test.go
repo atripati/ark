@@ -137,11 +137,14 @@ func TestSupervisedRejectRetryAllowChain(t *testing.T) {
 }
 
 func TestSupervisionBridgeFromPkgSupervise(t *testing.T) {
-	d := supervise.New().Evaluate(supervise.Request{Constraint: "rank",
+	d, err := supervise.New().Evaluate(supervise.Request{Constraint: "rank", Scope: "txn-1",
 		Proposed: supervise.ProposedAction{Option: "A"},
 		Evidence: supervise.Evidence{RequestedRank: 2, EvidenceComplete: true,
 			Options: []supervise.Option{{ID: "A", Price: 163, IsDirect: true}, {ID: "B", Price: 290}}},
 		RetryCount: 0, Budget: 4})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	s := SupervisionFromDecision(d, "evidence#42")
 	if s.Verdict != "REJECT" || s.SuggestedFromEvidence != "B" || s.TrustedEvidenceRef != "evidence#42" {
 		t.Fatalf("bridge mismapped: %+v", s)

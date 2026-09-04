@@ -26,8 +26,9 @@ native gates; the tool wrapper is the thinnest and works with any graph.)
 Parallel tool calls: LangGraph's ToolNode runs a turn's tools in a thread pool, so several may
 hit one ARK session at once. That is transport-safe — ARK serializes access to the single
 session, so the thread pool cannot corrupt it, and independent parallel calls trace cleanly.
-Supervised parallel calls are each gated independently (one check/verdict per proposal, sharing
-the per-constraint retry counter). ARK does not yet do coordinated batch/transaction supervision
+Supervised parallel calls are each gated independently (one check/verdict per proposal, with the
+retry budget keyed per (scope, constraint) so distinct entities do not share a budget). ARK does
+not yet do coordinated batch/transaction supervision
 across several simultaneous proposals; the strongest supported model stays sequential: one
 proposed action -> check -> execute/reject -> replan. Async graphs are out of scope.
 """
@@ -157,15 +158,25 @@ def build_agent(model: Any, tools: Any, **kwargs) -> Any:
 
 def ark_supervise_tool(run: RunSession, tool: Any, *, constraint: str,
                        evidence: "dict | Callable[[dict], dict]",
-                       proposed: "Optional[Callable[[dict], dict]]" = None) -> StructuredTool:
+                       proposed: "Optional[Callable[[dict], dict]]" = None,
+                       scope: "str | Callable[[dict], str] | None" = None,
+                       transaction: "str | Callable[[dict], str] | None" = None) -> StructuredTool:
     """Wrap a LangGraph/LangChain tool so ARK gates each proposed call before it executes.
 
     ``constraint`` names the runtime constraint (e.g. "rank"); ``evidence`` is the trusted
     runtime evidence — a static dict or a ``fn(tool_args) -> dict`` computed from the call.
     ``proposed`` maps the tool args to the ProposedAction dict (default: ``{"option": <first
-    arg>}``). On ALLOW the real tool runs and the executed telemetry is recorded on the SAME
-    decision as the verdict (``of=verdict``); on any non-ALLOW verdict the tool does NOT run
-    and ARK's suggestion is returned as the tool result, so LangGraph's loop replans.
+    arg>}``). ``scope`` binds the retry budget to the transaction/entity being supervised — a
+    static id or a ``fn(tool_args) -> str`` (default: the tool name). To supervise several
+    independent entities through ONE tool, pass an entity-derived ``scope`` so their retry
+    budgets stay independent.
+
+    On ALLOW the real tool runs and the executed telemetry is recorded on the SAME decision as
+    the verdict (``of=verdict``), pinned to the exact action ARK evaluated via
+    ``action_fingerprint`` so a modified action cannot ride an old ALLOW; on any non-ALLOW
+    verdict the tool does NOT run and ARK's suggestion is returned as the tool result, so
+    LangGraph's loop replans. ARK fails CLOSED — an unknown constraint or malformed evidence
+    raises rather than silently allowing the call.
 
     The wrapper calls only ``run.check`` / ``run.record`` — the verdict, retry budget, and
     recovery all come from Go ARK. Requires the trace to be opened with supervision enabled.
@@ -177,18 +188,31 @@ def ark_supervise_tool(run: RunSession, tool: Any, *, constraint: str,
     def supervised(**kwargs):
         ev = evidence(kwargs) if callable(evidence) else evidence
         prop = proposed(kwargs) if callable(proposed) else _default_proposed(kwargs)
+        sc = scope(kwargs) if callable(scope) else (scope or name)
+        txn = transaction(kwargs) if callable(transaction) else transaction
         verdict: Verdict = run.check(proposed_action=prop, constraint=constraint,
-                                     evidence=ev or {}, action="tool_call", tool=name)
+                                     evidence=ev or {}, scope=sc, transaction=txn,
+                                     action="tool_call", tool=name)
         if verdict.allowed:
+            # PRE-EXECUTION gate: re-validate freshness/replay/action IMMEDIATELY before the side
+            # effect. Only a cleared authorization reaches the real tool (safe by default).
+            cleared = run.consume(verdict, executed_action=prop)
+            if not cleared.cleared:
+                run.record(action="tool_call", tool=name, tool_args=kwargs,
+                           outcome="blocked:stale", executed=False, of=verdict)
+                return (f"ARK blocked this action before execution: {cleared.reason or 'authorization no longer valid'}. "
+                        f"Gather fresh evidence and re-propose.")
             try:
                 result = raw(**kwargs)
             except Exception as exc:  # a supervised action that was allowed but then failed
                 run.record(action="tool_call", tool=name, tool_args=kwargs,
                            outcome=f"error: {type(exc).__name__}", error=_err(exc),
-                           executed=True, of=verdict)
+                           executed=True, of=verdict, executed_action=prop)
                 raise  # let LangGraph handle the tool error natively
+            # record with the EXACT action that was checked+consumed (prop): ARK re-canonicalizes
+            # it and verifies it matches the authorized action.
             run.record(action="tool_call", tool=name, tool_args=kwargs,
-                       outcome="success", of=verdict)
+                       outcome="success", of=verdict, executed_action=prop)
             return result
         run.record(action="tool_call", tool=name, tool_args=kwargs,
                    outcome=f"rejected:{verdict.verdict}", executed=False, of=verdict)

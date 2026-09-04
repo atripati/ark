@@ -40,6 +40,7 @@ class _FakeVerdict:
         self.decision_id, self.verdict = decision_id, verdict
         self.allowed = verdict == "ALLOW"
         self.suggested, self.reason = suggested, reason
+        self.action_fingerprint = "sha256:fake"
 
 
 class SpyRun:
@@ -53,10 +54,19 @@ class SpyRun:
         self.records.append(kwargs)
         return f"decision_{len(self.records):03d}"
 
-    def check(self, *, proposed_action, constraint, evidence, action="tool_call", tool=None):
+    def check(self, *, proposed_action, constraint, evidence, scope=None, transaction=None,
+              agent_id=None, action="tool_call", tool=None, max_evidence_age=None):
         self.checks.append(dict(proposed_action=proposed_action, constraint=constraint,
-                                evidence=evidence, action=action, tool=tool))
+                                evidence=evidence, scope=scope, action=action, tool=tool))
         return self._verdicts.pop(0)
+
+    def consume(self, of, executed_action):
+        self.consumes = getattr(self, "consumes", [])
+        self.consumes.append(dict(of=of, executed_action=executed_action))
+        class _C:  # cleared pre-execution gate
+            cleared = True
+            reason = None
+        return _C()
 
 
 @tool
