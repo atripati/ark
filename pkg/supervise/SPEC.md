@@ -179,9 +179,14 @@ same, to the extent the filesystem honors the fsyncs ARK issues. On-disk corrupt
 record, orphan/inconsistent markers, bad schema) is detected and reported `CORRUPT` — fail closed,
 never re-issued. Durable mode is **fsync-bound**: throughput is ~tens–hundreds of lifecycles/sec
 (not the in-memory ~100k/s) — an accepted correctness-over-throughput trade for consequential
-actions. Single-winner consume relies on POSIX `O_EXCL` on a **local** filesystem; some network
-filesystems do not honor it — durable mode is supported on local Linux/macOS, and the `Store`
-interface leaves room for a future transactional (SQL/Redis) backend without changing semantics.
+actions. Single-winner consume relies on POSIX `O_EXCL` and a parent-directory `fsync` on a **local**
+filesystem; some network filesystems do not honor `O_EXCL`, and **Windows cannot fsync a directory
+handle at all** — so durable mode is supported on local **Linux/macOS only**. On Windows the durable
+store is **unsupported and enforced**: `OpenFileStore` fails closed with `ErrUnsupportedPlatform`
+before any I/O (never a silent in-memory fallback); general ARK supervision with in-memory
+authorization remains fully supported there. The `Store` interface leaves room for a future
+transactional (SQL/Redis) backend that would lift this platform restriction without changing
+semantics.
 
 ## Trusted evidence plane
 

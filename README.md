@@ -17,7 +17,7 @@ pip install ark-agent-runtime
 from ark import ARK
 ```
 
-Release-candidate software, version 0.1.0rc1. Supervision is experimental and off by default.
+Release-candidate software, version 0.1.0rc2. Supervision is experimental and off by default.
 
 ## Why ARK
 
@@ -142,6 +142,8 @@ Boundaries (precise): ARK enforces this only for actions routed through the supe
 Trusted evidence: the agent authors the proposed action; an application-configured `EvidenceProvider` (which the agent cannot select, replace, edit, or downgrade) establishes the facts through a separate trust channel; ARK deterministically checks the action against them. Evidence is trust-classified (`TRUSTED_PROVIDER` / `CALLER_SUPPLIED` / `AGENT_SUPPLIED`), and a protected constraint only ALLOWs on `TRUSTED_PROVIDER` evidence bound to the exact request/subject/tenant — so `check(action, evidence=agent_output)` can never authorize a protected action; only `check(action, provider="billing")` can. Precise claim: **ARK separates agent-authored proposals from evidence obtained through application-configured trust channels and binds authorization to that evidence deterministically — it does not prove the facts are true** (a provider can itself be wrong/compromised). No LLM judges evidence.
 
 Durability: by default authorization state is in-memory (lost on process exit; an old authorization then fails closed). Set `ARK_AUTHZ_DIR=<dir>` to enable the durable store — the `ISSUED → CONSUMED` transition is then atomic and single-winner across restarts, crashes, and multiple ARK instances sharing that directory, retry-exhaustion survives restart, and a store failure fails closed. After a crash, a CONSUMED authorization whose outcome is unknown is reported as AMBIGUOUS for reconciliation — never silently retried.
+
+Platforms: ARK supervision (including in-memory authorization) is supported on Linux, macOS, and **Windows**. The **durable** `ARK_AUTHZ_DIR` store is **POSIX-only** (Linux/macOS on a local filesystem): its durability requires a parent-directory `fsync`, which Windows does not permit. On Windows, requesting the durable store **fails closed** with an explicit unsupported-platform error rather than degrading silently — in-memory supervision is unaffected.
 
 Supervision is not a correctness guarantee. It does not make an agent safe, and it does not catch every bad action. It gives the runtime one place to check a proposed consequential action against a constraint and trusted evidence before the action runs.
 

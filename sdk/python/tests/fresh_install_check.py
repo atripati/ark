@@ -77,25 +77,44 @@ def main():
                       scope="customer-1", transaction="t1", provider="billing")
     check("poisoned proposal rejected by trusted provider fact", v.verdict == "REJECT")
 
-    # durable authorization smoke: consume-once survives; store errors would fail closed
-    print("\ndurable authorization smoke:")
+    # durable authorization backend — POSIX-only by contract.
+    #   POSIX (Linux/macOS):  the durable FileStore must clear-once then refuse a replay.
+    #   Windows:              the durable FileStore is explicitly UNSUPPORTED and MUST fail closed
+    #                         with an explicit unsupported-platform reason — never silently fall
+    #                         back to in-memory, never surface a vague OS error.
+    print("\ndurable authorization backend (platform contract):")
     import tempfile
+    from ark.errors import ArkBridgeError, ArkError
+    prov = {"billing": lambda req: {"facts": {"limit": 500.0}, "subject": req["scope"]}}
     os.environ["ARK_AUTHZ_DIR"] = tempfile.mkdtemp(prefix="ark-authz-")
     try:
-        with ARK(supervision="experimental", providers={"billing": lambda req: {"facts": {"limit": 500.0}, "subject": req["scope"]}}).trace("durable") as run:
-            act = {"kind": "refund", "fields": {"amount": 100}}
-            v = run.check(act, constraint="threshold", scope="customer-1", transaction="t2", provider="billing")
-            cleared = v.allowed and run.consume(v, executed_action=act).cleared
-            if cleared:
-                run.record(action="tool_call", tool="refund", of=v, executed=True, executed_action=act)
-            # a second consume of the same authorization must be refused (single-use)
-            from ark.errors import ArkBridgeError as _ABE
-            dup_refused = False
+        if os.name == "nt":
+            # Windows: requesting the durable FileStore must fail closed with an explicit reason.
+            failed_closed, msg = False, ""
             try:
-                run.consume(v, executed_action=act)
-            except _ABE:
-                dup_refused = True
-        check("durable authorization cleared once then refused a second consume", cleared and dup_refused)
+                with ARK(supervision="experimental", providers=prov).trace("durable-win") as run:
+                    act = {"kind": "refund", "fields": {"amount": 100}}
+                    run.check(act, constraint="threshold", scope="customer-1", transaction="t2", provider="billing")
+            except ArkError as e:
+                failed_closed, msg = True, str(e).lower()
+            check("Windows: durable FileStore request FAILS CLOSED (no silent in-memory fallback)", failed_closed)
+            check("Windows: failure states the real POSIX/platform reason (not a vague 'access is denied')",
+                  ("posix" in msg or "unsupported" in msg) and "access is denied" not in msg)
+        else:
+            # POSIX: durable single-use must work end to end.
+            with ARK(supervision="experimental", providers=prov).trace("durable") as run:
+                act = {"kind": "refund", "fields": {"amount": 100}}
+                v = run.check(act, constraint="threshold", scope="customer-1", transaction="t2", provider="billing")
+                cleared = v.allowed and run.consume(v, executed_action=act).cleared
+                if cleared:
+                    run.record(action="tool_call", tool="refund", of=v, executed=True, executed_action=act)
+                # a second consume of the same authorization must be refused (single-use)
+                dup_refused = False
+                try:
+                    run.consume(v, executed_action=act)
+                except ArkBridgeError:
+                    dup_refused = True
+            check("POSIX: durable authorization cleared once then refused a second consume", cleared and dup_refused)
     finally:
         os.environ.pop("ARK_AUTHZ_DIR", None)
 

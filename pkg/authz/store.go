@@ -48,6 +48,13 @@ var (
 	ErrSchema          = errors.New("authz: incompatible persisted schema")    // unknown version -> loud fail (DUR + Phase 15)
 	ErrCorrupt         = errors.New("authz: corrupt authorization state")      // inconsistent/damaged on disk -> fail closed, reconcile
 	ErrBadID           = errors.New("authz: malformed authorization id")       // not a canonical ARK id -> reject before any I/O
+	// ErrUnsupportedPlatform is returned by OpenFileStore when the durable FileStore's POSIX
+	// durability primitives (O_EXCL create + file fsync + parent-directory fsync) are not
+	// available on the host platform (e.g. Windows, where a directory handle cannot be fsync'd).
+	// Rather than silently degrade durability, the durable backend fails closed with this error;
+	// callers must NOT fall back to in-memory. General ARK supervision (in-memory authorization)
+	// is unaffected.
+	ErrUnsupportedPlatform = errors.New("authz: durable FileStore unsupported on this platform")
 )
 
 // validAuthID matches ARK's canonical authorization id. Any id reaching the durable store is

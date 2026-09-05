@@ -44,9 +44,28 @@ type FileStore struct {
 	mu sync.Mutex
 }
 
+// unsupportedPlatformFileStoreErr builds the explicit, architectural fail-closed error used when
+// the durable FileStore is requested on a platform that cannot honor its POSIX durability
+// contract. Kept as a plain function of goos so the message is unit-testable on any host, while
+// the per-platform DECISION lives in the build-tagged fileStorePlatformError.
+func unsupportedPlatformFileStoreErr(goos string) error {
+	return fmt.Errorf("%w: durable FileStore requires a supported local POSIX filesystem "+
+		"(Linux/macOS); it is not supported on %s because a parent-directory fsync — required for "+
+		"the crash/power-loss durability guarantee — is unavailable there. Run ARK supervision "+
+		"with in-memory authorization (leave ARK_AUTHZ_DIR unset) on this platform.",
+		ErrUnsupportedPlatform, goos)
+}
+
 // OpenFileStore opens (creating if needed) a durable store rooted at dir. An existing store with
 // an incompatible SchemaVersion fails loudly with ErrSchema — never silently reinterpreted.
+//
+// On a platform whose filesystem cannot honor the durability contract (see fileStorePlatformError,
+// e.g. Windows), it fails closed with ErrUnsupportedPlatform BEFORE touching the filesystem — it
+// never silently degrades to a weaker/in-memory guarantee.
 func OpenFileStore(dir string) (*FileStore, error) {
+	if err := fileStorePlatformError(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("%w: mkdir %s: %v", ErrStore, dir, err)
 	}

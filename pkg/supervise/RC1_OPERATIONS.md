@@ -7,11 +7,29 @@ backed by code + tests; nothing is aspirational.
 
 **Supported substrate:** a **local POSIX filesystem** (Linux/macOS: ext4, xfs, apfs, …). The
 cross-process single-winner guarantee rests on the atomicity of `open(O_CREATE|O_EXCL)` and on
-`fsync` honoring durability. It is **not supported on network filesystems** (NFS, SMB, many
-object-store gateways) where `O_EXCL`/`fsync` semantics may be weaker — do not run durable mode on
-those; a networked transactional `Store` implementation is a future phase (the interface is ready).
-ARK does **not** attempt to auto-detect the filesystem (there is no reliable, safe probe); the
-contract is documented rather than enforced.
+`fsync` — of the file **and its parent directory** — honoring durability. It is **not supported on
+network filesystems** (NFS, SMB, many object-store gateways) where `O_EXCL`/`fsync` semantics may be
+weaker — do not run durable mode on those; a networked transactional `Store` implementation is a
+future phase (the interface is ready). ARK does **not** attempt to auto-detect the *filesystem type*
+(there is no reliable, safe probe), so the NFS/SMB exclusion is documented rather than enforced.
+
+**Platform support (enforced):**
+
+| platform | ARK supervision (bridge, deterministic constraints, trusted evidence, action binding, freshness, transaction isolation, **in-memory** authorization) | durable FileStore (`ARK_AUTHZ_DIR`) |
+|---|---|---|
+| Linux (local POSIX) | ✅ supported | ✅ supported |
+| macOS (local POSIX) | ✅ supported | ✅ supported |
+| **Windows** | ✅ **supported** (in-memory authorization) | ❌ **unsupported — fails closed** |
+
+The durable FileStore is **POSIX-only** because its crash/power-loss durability requires a
+**parent-directory `fsync`**, and a directory handle **cannot be fsync'd on Windows** (the call
+returns `Access is denied`). This is an architectural limit, not a bug. Therefore, unlike the
+filesystem-type exclusion above, the **platform** gate **is enforced**: on Windows, `OpenFileStore`
+(and thus setting `ARK_AUTHZ_DIR`) **fails closed** with `ErrUnsupportedPlatform` *before any I/O* —
+it never silently degrades to a weaker guarantee and never falls back to in-memory. General ARK
+supervision is fully supported on Windows; only the durable backend is restricted. To run
+consequential, restart-durable authorization today, use Linux or macOS on a local filesystem (a
+networked transactional `Store` is the future path for other platforms/fleets).
 
 **What survives what:**
 
