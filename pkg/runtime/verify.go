@@ -230,9 +230,6 @@ func structuralLint(block CodeBlock) []string {
 	// Language-specific
 	switch block.Language {
 	case "go":
-		if strings.Contains(code, "func ") && !strings.Contains(code, "package ") {
-			issues = append(issues, "missing package declaration")
-		}
 	case "python":
 		hasTab := strings.Contains(code, "\t")
 		hasSpace := false
